@@ -1,0 +1,20 @@
+{
+  "name": "qq-group-ai-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "QQ 群聊机器人：确定性斜杠命令与 AI 自然语言工具调用共享同一命令层",
+  "main": "app.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env app.js",
+    "test": "node --test",
+    "check": "node --check app.js && node --test"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.2.5",
+    "openai": "^7.4.0"
+  }
+}

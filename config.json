@@ -1,0 +1,27 @@
+{
+  "qq": {
+    "intents": 33554432,
+    "requestTimeoutMs": 10000,
+    "maxRetries": 2,
+    "reconnectBaseDelayMs": 1000,
+    "reconnectMaxDelayMs": 30000
+  },
+  "ai": {
+    "requestTimeoutMs": 30000,
+    "maxRetries": 2
+  },
+  "memory": {
+    "databasePath": "./data/koi.sqlite",
+    "historyMessages": 12,
+    "embeddingModel": "text-embedding-3-small",
+    "recallLimit": 5,
+    "candidateLimit": 500,
+    "minimumSimilarity": 0.2,
+    "maxOperationsPerMessage": 4
+  },
+  "bot": {
+    "commandPrefix": "/",
+    "dedupTtlMs": 600000,
+    "maxReplyChars": 1500
+  }
+}
