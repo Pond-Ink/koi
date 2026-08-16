@@ -19,12 +19,16 @@ function payload({ id, content }) {
       content,
       group_openid: "group-1",
       author: { member_openid: "member-1", username: "小明", bot: false },
+      mentions: [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }],
       message_scene: { ext: [`msg_idx=${id}`] },
     },
   };
 }
 
-function createService(aiAgent, { longTermMemory = null } = {}) {
+function createService(
+  aiAgent,
+  { longTermMemory = null, botMemberOpenid = "bot-member-openid", botIdentityResolver } = {},
+) {
   const sent = [];
   const memory = new LangChainGroupMemory();
   const aiControl = new GroupAiControl();
@@ -36,6 +40,12 @@ function createService(aiAgent, { longTermMemory = null } = {}) {
     memory,
     longTermMemory,
     aiControl,
+    botIdentityResolver: botIdentityResolver || {
+      async getMemberOpenid(groupOpenid) {
+        assert.equal(groupOpenid, "group-1");
+        return botMemberOpenid;
+      },
+    },
     logger,
   });
   return { service, sent, memory, aiControl };
@@ -48,6 +58,68 @@ test("斜杠命令绕过 AI", async () => {
   assert.equal(aiCalls, 0);
   assert.equal(sent[0].content, "pong");
   assert.equal(sent[0].msgId, "msg-1");
+});
+
+test("AT 事件不依赖 mentions 或群状态接口即可执行手写命令", async () => {
+  let aiCalls = 0;
+  const event = payload({ id: "at-without-mentions", content: "/ping" });
+  event.d.mentions = [];
+  const { service, sent } = createService(
+    { async respond() { aiCalls += 1; } },
+    {
+      botIdentityResolver: {
+        async getMemberOpenid() {
+          assert.fail("AT 事件不应查询 bot_state");
+        },
+      },
+    },
+  );
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(aiCalls, 0);
+  assert.equal(sent[0].content, "pong");
+});
+
+test("非群消息事件在查询群身份前即被忽略", async () => {
+  let identityCalls = 0;
+  const { service, sent } = createService(
+    { async respond() { assert.fail("非群消息不应进入 AI"); } },
+    {
+      botIdentityResolver: {
+        async getMemberOpenid() {
+          identityCalls += 1;
+          return "bot-member-openid";
+        },
+      },
+    },
+  );
+  const event = payload({ id: "not-a-message", content: "忽略" });
+  event.op = 11;
+  event.t = "GROUP_MESSAGE_CREATE";
+
+  assert.equal(await service.handleGatewayPayload(event), false);
+  assert.equal(identityCalls, 0);
+  assert.equal(sent.length, 0);
+});
+
+test("AT 事件正文中的 mention 前缀不会阻止手写命令解析", async () => {
+  let aiCalls = 0;
+  const event = payload({
+    id: "at-command-with-prefix",
+    content: "<@bot-member_openid-1> /ping",
+  });
+  event.d.mentions = [];
+  const { service, sent } = createService({
+    async respond() {
+      aiCalls += 1;
+    },
+  });
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(aiCalls, 0);
+  assert.equal(sent[0].content, "pong");
 });
 
 test("已删除的 echo 和 sum 不再暴露给 AI", async () => {
@@ -100,11 +172,12 @@ test("引用内容不会改变斜杠命令的确定性路由", async () => {
   assert.equal(sent[0].content, "pong");
 });
 
-test("全量群消息只写入 LangChain 记忆，后续 @ 消息可读取上下文", async () => {
+test("全量群消息由 AI 静默旁听并写入记忆，后续明确 @ 可读取上下文", async () => {
   const seenHistories = [];
   const aiAgent = {
-    async respond({ history }) {
+    async respond({ history, engagement }) {
       seenHistories.push(history);
+      if (engagement === "opportunistic") return { text: null, route: "ai-silent" };
       return { text: "ok", route: "ai-text" };
     },
   };
@@ -112,26 +185,103 @@ test("全量群消息只写入 LangChain 记忆，后续 @ 消息可读取上下
 
   const observed = payload({ id: "msg-5", content: "下周团建去杭州" });
   observed.t = "GROUP_MESSAGE_CREATE";
+  observed.d.mentions = [];
   await service.handleGatewayPayload(observed);
   assert.equal(sent.length, 0);
-  assert.equal(seenHistories.length, 0);
+  assert.deepEqual(seenHistories[0], []);
 
   await service.handleGatewayPayload(payload({ id: "msg-6", content: "刚才说去哪？" }));
   assert.equal(sent.length, 1);
-  assert.deepEqual(seenHistories[0], [
+  assert.deepEqual(seenHistories[1], [
     { role: "user", content: "小明：下周团建去杭州" },
   ]);
 });
 
-test("全量群消息中的斜杠命令仍直接执行", async () => {
-  let aiCalls = 0;
-  const event = payload({ id: "msg-7", content: "/ping" });
+test("全量群消息中的明确 @ 直接进入必答 AI 路径", async () => {
+  let engagement;
+  const event = payload({ id: "msg-full-at", content: "在吗？" });
   event.t = "GROUP_MESSAGE_CREATE";
-  const { service, sent } = createService({ async respond() { aiCalls += 1; } });
+  event.d.mentions = [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }];
+  const { service, sent } = createService({
+    async respond(input) {
+      engagement = input.engagement;
+      return { text: "我在。", route: "ai-text" };
+    },
+  });
 
   await service.handleGatewayPayload(event);
 
-  assert.equal(aiCalls, 0);
+  assert.equal(engagement, "direct");
+  assert.equal(sent[0].content, "我在。");
+});
+
+test("全量群消息中只有 @ 机器人时结合已有上下文回复", async () => {
+  const calls = [];
+  const { service, sent } = createService({
+    async respond(input) {
+      calls.push(input);
+      if (input.engagement === "opportunistic") return { text: null, route: "ai-silent" };
+      return { text: "刚才在讨论周六的团建。", route: "ai-text" };
+    },
+  });
+
+  const context = payload({ id: "msg-context", content: "团建改到周六" });
+  context.t = "GROUP_MESSAGE_CREATE";
+  context.d.mentions = [];
+  await service.handleGatewayPayload(context);
+
+  const onlyMention = payload({ id: "msg-only-at", content: "" });
+  onlyMention.t = "GROUP_MESSAGE_CREATE";
+  onlyMention.d.mentions = [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }];
+  await service.handleGatewayPayload(onlyMention);
+
+  assert.equal(calls[1].engagement, "direct");
+  assert.equal(calls[1].message.text, "");
+  assert.deepEqual(calls[1].history, [
+    { role: "user", content: "小明：团建改到周六" },
+  ]);
+  assert.equal(sent[0].content, "刚才在讨论周六的团建。");
+});
+
+test("全量群消息提及机器人名字时由 AI 择机发言", async () => {
+  const event = payload({ id: "msg-name", content: "Koi，你怎么看？" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  const { service, sent } = createService({
+    async respond({ engagement, message }) {
+      assert.equal(engagement, "opportunistic");
+      assert.equal(message.text, "Koi，你怎么看？");
+      return { text: "我倾向于先确认时间。", route: "ai-text" };
+    },
+  });
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(sent[0].content, "我倾向于先确认时间。");
+});
+
+test("全量群消息中只有明确 @ 当前机器人时才直接执行斜杠命令", async () => {
+  let aiCalls = 0;
+  const aiAgent = {
+    async respond() {
+      aiCalls += 1;
+      return { text: null, route: "ai-silent" };
+    },
+  };
+  const { service, sent } = createService(aiAgent, { botMemberOpenid: "current-member" });
+
+  const withoutMention = payload({ id: "msg-7-no-at", content: "/ping" });
+  withoutMention.t = "GROUP_MESSAGE_CREATE";
+  withoutMention.d.mentions = [];
+  await service.handleGatewayPayload(withoutMention);
+
+  const event = payload({ id: "msg-7-at", content: "<@current-member> /ping" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [{ member_openid: "current-member", username: "Koi" }];
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(aiCalls, 1);
   assert.equal(sent[0].content, "pong");
 });
 
@@ -198,6 +348,7 @@ test("AI 回避期间普通消息不调用任何 AI 能力、不回复且不写�
   await service.handleGatewayPayload(payload({ id: "avoid-at", content: "这条消息不能发给 AI" }));
   const observed = payload({ id: "avoid-full", content: "这条群消息也不能进入记忆" });
   observed.t = "GROUP_MESSAGE_CREATE";
+  observed.d.mentions = [];
   await service.handleGatewayPayload(observed);
 
   assert.equal(sent.length, 1);

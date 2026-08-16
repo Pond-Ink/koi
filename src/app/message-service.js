@@ -1,7 +1,9 @@
 import { CommandError } from "../commands/command-registry.js";
 import { formatMessageForAi } from "../ai/message-context.js";
-import { normalizeGroupMessageEvent } from "../qq/qq-event-normalizer.js";
-import { GroupAiControl } from "./group-ai-control.js";
+import {
+  isSupportedGroupMessageEvent,
+  normalizeGroupMessageEvent,
+} from "../qq/qq-event-normalizer.js";
 
 function splitText(text, maxChars) {
   const chunks = [];
@@ -17,6 +19,30 @@ function splitText(text, maxChars) {
   return chunks;
 }
 
+function stripLeadingMentions(text) {
+  let remaining = text.trimStart();
+  while (remaining.startsWith("<@")) {
+    const closingBracket = remaining.indexOf(">");
+    if (closingBracket < 3) break;
+    remaining = remaining.slice(closingBracket + 1).trimStart();
+  }
+  return remaining;
+}
+
+function classifyMessage(message, { aiEnabled, commandPrefix }) {
+  const commandText = message.isExplicitBotMention
+    ? stripLeadingMentions(message.text)
+    : "";
+  if (commandText.startsWith(commandPrefix)) {
+    return { kind: "command", commandText };
+  }
+  if (!aiEnabled) return { kind: "ignored" };
+  return {
+    kind: "ai",
+    engagement: message.isExplicitBotMention ? "direct" : "opportunistic",
+  };
+}
+
 export class MessageService {
   constructor({
     qqApi,
@@ -25,7 +51,8 @@ export class MessageService {
     deduplicator,
     memory,
     longTermMemory = null,
-    aiControl = new GroupAiControl(),
+    botIdentityResolver,
+    aiControl,
     maxReplyChars = 1500,
     logger,
   }) {
@@ -35,6 +62,7 @@ export class MessageService {
     this.deduplicator = deduplicator;
     this.memory = memory;
     this.longTermMemory = longTermMemory;
+    this.botIdentityResolver = botIdentityResolver;
     this.aiControl = aiControl;
     this.maxReplyChars = maxReplyChars;
     this.logger = logger;
@@ -68,14 +96,35 @@ export class MessageService {
     await Promise.allSettled([...this.groupQueues.values()]);
   }
 
-  handleGatewayPayload(payload) {
-    const message = normalizeGroupMessageEvent(payload);
-    if (!message) return Promise.resolve(false);
+  async handleGatewayPayload(payload) {
+    if (!isSupportedGroupMessageEvent(payload)) return false;
+    const botMemberOpenid = await this.resolveBotMemberOpenid(payload);
+    const message = normalizeGroupMessageEvent(payload, { botMemberOpenid });
+    if (!message) return false;
     if (this.deduplicator.isDuplicate(message.dedupKey)) {
       this.logger.debug("忽略重复群消息", { msgId: message.msgId, msgIndex: message.msgIndex });
-      return Promise.resolve(false);
+      return false;
     }
 
+    return this.enqueue(message);
+  }
+
+  async resolveBotMemberOpenid(payload) {
+    const groupOpenid = payload?.d?.group_openid;
+    if (payload?.t !== "GROUP_MESSAGE_CREATE" || !groupOpenid) return null;
+
+    try {
+      return await this.botIdentityResolver.getMemberOpenid(String(groupOpenid));
+    } catch (error) {
+      this.logger.error("获取机器人群身份失败", {
+        error,
+        groupOpenid: String(groupOpenid),
+      });
+      return null;
+    }
+  }
+
+  enqueue(message) {
     const previous = this.groupQueues.get(message.groupOpenid) || Promise.resolve();
     const current = previous.then(() => this.processMessage(message));
     const tracked = current.finally(() => {
@@ -88,12 +137,15 @@ export class MessageService {
   }
 
   async processMessage(message) {
-    const isSlashCommand = this.registry.isSlashCommand(message.text);
     const aiWasEnabled = this.aiControl.isEnabled(message.groupOpenid);
+    const route = classifyMessage(message, {
+      aiEnabled: aiWasEnabled,
+      commandPrefix: this.registry.prefix,
+    });
     const commandContext = { message, aiControl: this.aiControl };
     const memoryContent = formatMessageForAi(message);
 
-    if (!isSlashCommand && !aiWasEnabled) {
+    if (route.kind === "ignored") {
       this.logger.info("AI 回避期间忽略群消息", {
         eventType: message.type,
         msgId: message.msgId,
@@ -102,37 +154,14 @@ export class MessageService {
       return true;
     }
 
-    if (
-      message.type === "GROUP_MESSAGE_CREATE"
-      && !isSlashCommand
-    ) {
-      await this.memory.addUserMessage(message.groupOpenid, memoryContent);
-      const remembered = await this.observeLongTermMemory(message);
-      this.logger.info("群消息已写入记忆", {
-        eventType: message.type,
-        msgId: message.msgId,
-        route: "memory-observe",
-        longTermOperations: remembered,
-      });
-      return true;
-    }
-
     let result;
-
     try {
-      if (isSlashCommand) {
-        result = { ...(await this.registry.executeSlash(message.text, commandContext)), route: "slash" };
-      } else {
-        const longTermMemories = await this.recallLongTermMemory(message);
-        result = await this.aiAgent.respond({
-          message,
-          history: await this.memory.get(message.groupOpenid),
-          longTermMemories,
-          tools: this.registry.toAiTools(),
-          executeTool: (name, args) => this.registry.executeTool(name, args, commandContext),
-        });
-      }
+      result = await this.executeRoute(route, message, commandContext);
     } catch (error) {
+      if (route.kind === "ai" && route.engagement === "opportunistic") {
+        this.logger.error("旁听群消息时 AI 处理失败，已静默降级", { error, msgId: message.msgId });
+        return this.rememberWithoutReply(message, memoryContent, "ai-observe-fallback");
+      }
       if (error instanceof CommandError) {
         result = { text: `命令错误：${error.message}`, route: "command-error" };
       } else {
@@ -141,7 +170,64 @@ export class MessageService {
       }
     }
 
-    const chunks = splitText(result.text, this.maxReplyChars);
+    if (route.kind === "ai" && result.text === null) {
+      return this.rememberWithoutReply(message, memoryContent, result.route);
+    }
+
+    const replyChunks = await this.sendReply(message, result.text);
+    const aiIsEnabledAfter = this.aiControl.isEnabled(message.groupOpenid);
+    if (aiWasEnabled && aiIsEnabledAfter) {
+      await this.memory.addTurn(message.groupOpenid, {
+        user: memoryContent,
+        assistant: result.text,
+      });
+    }
+    const remembered = route.kind === "command" || !aiIsEnabledAfter
+      ? 0
+      : await this.observeLongTermMemory(message);
+    this.logger.info("群消息已处理", {
+      eventType: message.type,
+      msgId: message.msgId,
+      route: result.route,
+      commandName: result.commandName,
+      replyChunks,
+      longTermOperations: remembered,
+    });
+    return true;
+  }
+
+  async executeRoute(route, message, commandContext) {
+    if (route.kind === "command") {
+      return {
+        ...(await this.registry.executeSlash(route.commandText, commandContext)),
+        route: "slash",
+      };
+    }
+
+    return this.aiAgent.respond({
+      message,
+      history: await this.memory.get(message.groupOpenid),
+      longTermMemories: await this.recallLongTermMemory(message),
+      tools: this.registry.toAiTools(),
+      executeTool: (name, args) => this.registry.executeTool(name, args, commandContext),
+      engagement: route.engagement,
+    });
+  }
+
+  async rememberWithoutReply(message, memoryContent, route) {
+    await this.memory.addUserMessage(message.groupOpenid, memoryContent);
+    const remembered = await this.observeLongTermMemory(message);
+    this.logger.info("群消息已静默写入记忆", {
+      eventType: message.type,
+      msgId: message.msgId,
+      route,
+      longTermOperations: remembered,
+    });
+    return true;
+  }
+
+  async sendReply(message, text) {
+    const chunks = splitText(text, this.maxReplyChars);
     for (let index = 0; index < chunks.length; index += 1) {
       await this.qqApi.sendGroupText({
         groupOpenid: message.groupOpenid,
@@ -150,25 +236,6 @@ export class MessageService {
         msgSeq: index + 1,
       });
     }
-
-    const aiIsEnabledAfter = this.aiControl.isEnabled(message.groupOpenid);
-    if (aiWasEnabled && aiIsEnabledAfter) {
-      await this.memory.addTurn(message.groupOpenid, {
-        user: memoryContent,
-        assistant: result.text,
-      });
-    }
-    const remembered = isSlashCommand || !aiIsEnabledAfter
-      ? 0
-      : await this.observeLongTermMemory(message);
-    this.logger.info("群消息已处理", {
-      eventType: message.type,
-      msgId: message.msgId,
-      route: result.route,
-      commandName: result.commandName,
-      replyChunks: chunks.length,
-      longTermOperations: remembered,
-    });
-    return true;
+    return chunks.length;
   }
 }

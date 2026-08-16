@@ -1,5 +1,13 @@
 const SUPPORTED_EVENTS = new Set(["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"]);
 
+export function isSupportedGroupMessageEvent(payload) {
+  return payload?.op === 0
+    && SUPPORTED_EVENTS.has(payload.t)
+    && Boolean(payload.d?.id)
+    && Boolean(payload.d?.group_openid)
+    && !payload.d?.author?.bot;
+}
+
 function findMessageIndex(message) {
   if (message.msg_idx !== undefined) return String(message.msg_idx);
   if (message.msg_seq !== undefined) return String(message.msg_seq);
@@ -77,32 +85,42 @@ function normalizeReplyTo(message) {
   });
 }
 
-export function normalizeGroupMessageEvent(payload, now = Date.now) {
-  if (payload?.op !== 0 || !SUPPORTED_EVENTS.has(payload.t)) return null;
+function hasExplicitBotMention(message, botMemberOpenid) {
+  if (!botMemberOpenid || !Array.isArray(message.mentions)) return false;
+  return message.mentions.some((mention) => (
+    mention?.member_openid !== undefined
+    && String(mention.member_openid) === String(botMemberOpenid)
+  ));
+}
+
+export function normalizeGroupMessageEvent(
+  payload,
+  { botMemberOpenid = null } = {},
+) {
+  if (!isSupportedGroupMessageEvent(payload)) return null;
   const message = payload.d;
-  if (!message?.id || !message.group_openid || message.author?.bot) return null;
 
   const replyTo = normalizeReplyTo(message);
   const text = (
     message.content?.trim()
     || collectCurrentElementText(message, replyTo?.messageId)
   ).trim();
-  if (!text) return null;
+  const isExplicitBotMention = payload.t === "GROUP_AT_MESSAGE_CREATE"
+    || hasExplicitBotMention(message, botMemberOpenid);
+  if (!text && !isExplicitBotMention) return null;
+
+  const msgIndex = findMessageIndex(message);
 
   return Object.freeze({
-    eventId: payload.id || null,
-    sequence: payload.s ?? null,
     type: payload.t,
     msgId: String(message.id),
-    msgIndex: findMessageIndex(message),
+    msgIndex,
     groupOpenid: String(message.group_openid),
     memberOpenid: String(message.author?.member_openid || message.author?.id || "unknown"),
-    memberRole: message.author?.member_role || "member",
     username: message.author?.username || "群成员",
     text,
+    isExplicitBotMention,
     replyTo,
-    attachments: message.attachments || [],
-    receivedAt: now(),
-    dedupKey: `${message.id}:${findMessageIndex(message)}`,
+    dedupKey: String(payload.id || `${message.id}:${msgIndex}`),
   });
 }

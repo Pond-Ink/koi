@@ -13,6 +13,7 @@ function quotePayload({ separator = "=" } = {}) {
       content: "这句话是什么意思？",
       group_openid: "group-1",
       author: { member_openid: "member-1", username: "小明", bot: false },
+      mentions: [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }],
       message_scene: {
         ext: ["msg_idx=current-idx", `ref_msg_idx${separator}quoted-idx`],
       },
@@ -30,9 +31,10 @@ function quotePayload({ separator = "=" } = {}) {
 }
 
 test("标准化群聊引用消息，且引用正文不混入当前正文", () => {
-  const message = normalizeGroupMessageEvent(quotePayload(), () => 123);
+  const message = normalizeGroupMessageEvent(quotePayload());
 
   assert.equal(message.text, "这句话是什么意思？");
+  assert.equal(message.dedupKey, "event-quote");
   assert.deepEqual(message.replyTo, {
     messageId: "quoted-idx",
     username: "小红",
@@ -58,4 +60,60 @@ test("仅有引用 ID 时仍向下游保留引用关系", () => {
     text: null,
     attachments: [],
   });
+});
+
+test("全量群消息通过 mentions 标记明确 @ 机器人，且允许只有 @", () => {
+  const payload = quotePayload();
+  payload.t = "GROUP_MESSAGE_CREATE";
+  payload.d.content = "";
+  payload.d.msg_elements = [];
+  payload.d.message_scene.ext = ["msg_idx=current-idx"];
+  payload.d.mentions = [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }];
+
+  const message = normalizeGroupMessageEvent(payload, {
+    botMemberOpenid: "bot-member-openid",
+  });
+  assert.equal(message.text, "");
+  assert.equal(message.isExplicitBotMention, true);
+});
+
+test("全量群消息按机器人在当前群的 member_openid 精确识别 @", () => {
+  const payload = quotePayload();
+  payload.t = "GROUP_MESSAGE_CREATE";
+  payload.d.mentions = [
+    { id: "same-global-id", member_openid: "another-member", bot: true, username: "Else" },
+    { id: "different-global-id", member_openid: "current-member", username: "Koi" },
+  ];
+
+  assert.equal(
+    normalizeGroupMessageEvent(payload, {
+      botMemberOpenid: "current-member",
+    }).isExplicitBotMention,
+    true,
+  );
+  assert.equal(
+    normalizeGroupMessageEvent(payload, {
+      botMemberOpenid: "missing-member",
+    }).isExplicitBotMention,
+    false,
+  );
+});
+
+test("AT 事件本身表示 @，全量事件则通过 mentions 判断", () => {
+  const atEvent = quotePayload();
+  atEvent.d.mentions = [];
+  assert.equal(normalizeGroupMessageEvent(atEvent).isExplicitBotMention, true);
+
+  const fullWithoutMention = quotePayload();
+  fullWithoutMention.t = "GROUP_MESSAGE_CREATE";
+  fullWithoutMention.d.mentions = [];
+  assert.equal(normalizeGroupMessageEvent(fullWithoutMention, {
+    botMemberOpenid: "bot-member-openid",
+  }).isExplicitBotMention, false);
+
+  const fullWithMention = quotePayload();
+  fullWithMention.t = "GROUP_MESSAGE_CREATE";
+  assert.equal(normalizeGroupMessageEvent(fullWithMention, {
+    botMemberOpenid: "bot-member-openid",
+  }).isExplicitBotMention, true);
 });

@@ -12,7 +12,7 @@
   },
   "memory": {
     "databasePath": "./data/koi.sqlite",
-    "historyMessages": 12,
+    "historyMessages": 32,
     "embeddingModel": "text-embedding-3-small",
     "recallLimit": 5,
     "candidateLimit": 500,

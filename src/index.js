@@ -13,6 +13,7 @@ import { SqliteDatabase } from "./memory/sqlite-database.js";
 import { SqliteLongTermMemoryStore } from "./memory/sqlite-long-term-memory-store.js";
 import { loadPersona } from "./persona/persona-loader.js";
 import { AccessTokenManager } from "./qq/access-token-manager.js";
+import { GroupBotIdentityResolver } from "./qq/group-bot-identity-resolver.js";
 import { QqApiClient } from "./qq/qq-api-client.js";
 import { QqGatewayClient } from "./qq/qq-gateway-client.js";
 
@@ -64,6 +65,7 @@ const messageService = new MessageService({
     maxMessages: config.memory.historyMessages,
   }),
   longTermMemory,
+  botIdentityResolver: new GroupBotIdentityResolver({ qqApi }),
   aiControl: new GroupAiControl({ database }),
   maxReplyChars: config.bot.maxReplyChars,
   logger,

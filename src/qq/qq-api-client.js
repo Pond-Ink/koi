@@ -111,6 +111,12 @@ export class QqApiClient {
     return this.request({ path: "/gateway" });
   }
 
+  getGroupBotState(groupOpenid) {
+    return this.request({
+      path: `/v2/groups/${encodeURIComponent(groupOpenid)}/bot_state`,
+    });
+  }
+
   sendGroupText({ groupOpenid, content, msgId, msgSeq = 1 }) {
     const body = { msg_type: 0, content };
     if (msgId) {

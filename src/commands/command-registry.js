@@ -38,10 +38,6 @@ export class CommandRegistry {
     return this.commands.get(canonical);
   }
 
-  isSlashCommand(text) {
-    return text.trimStart().startsWith(this.prefix);
-  }
-
   async executeSlash(text, context = {}) {
     const source = text.trimStart().slice(this.prefix.length).trim();
     const separator = source.search(/\s/);

@@ -18,6 +18,18 @@ const DEFAULT_PERSONA = Object.freeze({
   boundaries: [],
 });
 
+export const OPPORTUNISTIC_SILENCE = "[[KOI_NO_REPLY]]";
+
+function engagementInstructions(engagement) {
+  if (engagement === "direct") {
+    return "本条消息由用户明确 @ 机器人触发。必须作出有帮助的回应；即使 current_message 为空，也要结合最近群聊上下文理解这次呼叫后再回答。";
+  }
+  if (engagement === "opportunistic") {
+    return `本条消息来自机器人正在旁听的群聊。只有在以下任一情况成立时才发言：用户明确叫了你的 persona 名字、把问题或请求指向机器人/AI、正在讨论你或你的能力，或结合上下文可明确判断你的参与有帮助。若不该插话，必须只输出 ${OPPORTUNISTIC_SILENCE}，不得附加任何字符，也不得调用工具。`;
+  }
+  throw new TypeError(`不支持的群聊参与模式：${engagement}`);
+}
+
 function extractOutputText(response) {
   return (response.output || [])
     .filter((item) => item.type === "message")
@@ -56,7 +68,14 @@ export class OpenAIResponsesAgent {
     });
   }
 
-  async respond({ message, history, longTermMemories = [], tools, executeTool }) {
+  async respond({
+    message,
+    history,
+    longTermMemories = [],
+    tools,
+    executeTool,
+    engagement = "direct",
+  }) {
     const recalledMemory = formatLongTermMemoriesForAi(longTermMemories);
     const input = [
       ...history,
@@ -68,7 +87,7 @@ export class OpenAIResponsesAgent {
       response = await this.client.responses.create({
         model: this.model,
         store: false,
-        instructions: this.instructions,
+        instructions: `${this.instructions}\n\n<engagement>\n${engagementInstructions(engagement)}\n</engagement>`,
         input,
         tools,
         tool_choice: "auto",
@@ -96,6 +115,9 @@ export class OpenAIResponsesAgent {
     }
 
     const text = response.output_text?.trim() || extractOutputText(response);
+    if (engagement === "opportunistic" && text === OPPORTUNISTIC_SILENCE) {
+      return { text: null, route: "ai-silent" };
+    }
     if (!text) throw new OpenAIResponsesError("模型未返回文本或工具调用");
     return { text, route: "ai-text" };
   }

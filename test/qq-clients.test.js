@@ -42,3 +42,17 @@ test("群聊回复使用正确 URL、鉴权头和请求字段", async () => {
     msg_seq: 2,
   });
 });
+
+test("获取机器人群状态使用群级 bot_state 接口", async () => {
+  let requestUrl;
+  const client = new QqApiClient({
+    tokenManager: { async getToken() { return "access"; }, invalidate() {} },
+    fetchImpl: async (url) => {
+      requestUrl = url;
+      return new Response(JSON.stringify({ member_openid: "bot-member-openid" }), { status: 200 });
+    },
+  });
+
+  assert.equal((await client.getGroupBotState("group/id")).member_openid, "bot-member-openid");
+  assert.equal(requestUrl, "https://api.bot.qq.com/v2/groups/group%2Fid/bot_state");
+});

@@ -2,7 +2,6 @@ import { CommandError } from "../command-registry.js";
 
 export const pingCommand = Object.freeze({
   name: "ping",
-  aliases: [],
   allowNaturalLanguage: false,
   description: "检查机器人是否在线",
   usage: "/ping",

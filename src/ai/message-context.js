@@ -5,12 +5,21 @@ function summarizeAttachments(attachments = []) {
   }));
 }
 
+function currentMessageText(message) {
+  if (message.text) return message.text;
+  if (message.isExplicitBotMention) {
+    return "[用户仅 @ 机器人，未附带文字；请结合最近群聊上下文自然回应。]";
+  }
+  return "";
+}
+
 export function formatMessageForAi(message) {
-  if (!message.replyTo) return `${message.username}：${message.text}`;
+  const currentMessage = currentMessageText(message);
+  if (!message.replyTo) return `${message.username}：${currentMessage}`;
 
   return `以下是当前群聊消息的结构化数据：\n${JSON.stringify({
     sender: message.username,
-    current_message: message.text,
+    current_message: currentMessage,
     replied_message: {
       message_id: message.replyTo.messageId,
       sender: message.replyTo.username,

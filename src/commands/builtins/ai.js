@@ -15,7 +15,6 @@ const ACTIONS = new Map([
 
 export const aiCommand = Object.freeze({
   name: "ai",
-  aliases: [],
   allowNaturalLanguage: true,
   description: "临时开启、回避或查询本群的 AI 处理状态",
   aiDescription: "仅当用户明确要求 AI 停止参与、保持安静、暂时不要回复或进入回避状态时调用。此工具只能关闭 AI；用户询问状态或要求重新开启时不要调用，并提示必须发送 /ai status 或 /ai on。",

@@ -12,9 +12,9 @@ QQ WebSocket Gateway
         │
         ├─ AI 回避中 + 非命令 ─→ 本地忽略（不回复、不记忆、不调用 API）
         │
-        ├─ 全量普通群消息 ─→ SQLite 短期历史 ─→ 长期记忆抽取（不回复）
+        ├─ 全量普通群消息 ─→ OpenAI 判断是否插话 ─→ 静默记忆或回复/本地命令
         │
-        ├─ 以 / 开头 ─→ CommandRegistry ─→ 具体命令函数
+        ├─ 明确 @ 且以 / 开头 ─→ CommandRegistry ─→ 具体命令函数
         │
         └─ 普通文本 ─→ SQLite 长期记忆语义召回 ─→ OpenAI Responses API
                            ├─ 普通回答
@@ -26,13 +26,18 @@ POST /v2/groups/{group_openid}/messages
 
 核心边界：
 
-- `src/qq/`：QQ Access Token、OpenAPI、Gateway 和事件格式。
-- `src/commands/`：唯一可信的命令定义、参数校验和执行逻辑。
-- `src/ai/`：只负责自然语言判断和选择工具，不包含业务命令实现。
-- `src/app/`：编排、消息去重、群级串行处理和两层记忆服务。
-- `src/memory/`：SQLite、LangChain 消息历史、长期记忆抽取、Embedding 与召回。
+- `src/index.js`：组合根，只负责读取配置、组装依赖和管理启停。
+- `src/qq/`：QQ Access Token、OpenAPI、Gateway、群内机器人身份和事件标准化；不决定业务回复。
+- `src/app/message-service.js`：按“过滤与标准化 → 去重与同群排队 → 路由执行 → 回复与记忆”编排一次消息。
+- `src/commands/`：唯一可信的命令定义、参数校验和确定性执行逻辑。
+- `src/ai/`：构造模型上下文、判断是否插话和选择允许的工具，不实现命令业务。
+- `src/memory/` 与 `src/app/*memory*`：分别负责 SQLite 存储适配和短期/长期记忆用例。
+
+依赖方向保持单向：入口负责组装，`app` 编排 `qq`、`commands`、`ai` 与 `memory` 提供的能力；命令实现和存储适配不会反向依赖消息服务。
 
 用户回复一条群消息时，事件标准化层会把当前正文与被引用正文拆开。普通消息送给 AI 时使用明确的 `current_message` / `replied_message` 结构，便于理解“这个”“上面”等指代。引用正文只取自 QQ 当前事件，不维护引用消息缓存；引用内容只作为上下文，不会单独触发命令，斜杠命令始终只解析当前正文。
+
+是否“明确 @ 机器人”按事件来源分别判断：`GROUP_AT_MESSAGE_CREATE` 事件本身即表示机器人被 @（其 `mentions` 不要求包含机器人）；`GROUP_MESSAGE_CREATE` 则将事件 `mentions[].member_openid` 与 `GET /v2/groups/{group_openid}/bot_state` 返回的机器人群内 `member_openid` 比对。群内身份按 `group_openid` 缓存。QQ 正文中位于命令前的 `<@...>` 标记会先被跳过，因此 `<@机器人> /ping` 仍按 `/ping` 确定性执行。
 
 ## 记忆机制
 
@@ -41,9 +46,9 @@ POST /v2/groups/{group_openid}/messages
 
 短期记忆实现了 LangChain 的 `BaseListChatMessageHistory`：
 
-- `GROUP_MESSAGE_CREATE` 普通消息只进入记忆，不调用 AI、不发送回复。
-- `GROUP_AT_MESSAGE_CREATE` 会读取该群记忆并触发 AI。
-- AI 开启时，斜杠命令无论来自哪一种群消息事件都直接执行，结果也进入记忆。
+- 明确 @ 机器人（包括只有 @）会直接触发 AI 回复，并结合最近群聊理解空白消息。
+- `GROUP_MESSAGE_CREATE` 的其余消息会交给 AI 判断是否应插话；不应插话时只进入记忆，不发送回复。
+- AI 开启时，只有明确 @ 当前机器人的斜杠命令才直接执行；全量事件中未 @ 的斜杠文本按普通旁听消息处理。
 - 仅保留 `config.json` 中 `memory.historyMessages` 配置的最近消息。
 - 消息历史持久化在 `chat_messages` 表中，服务重启后仍然存在。
 
@@ -76,7 +81,7 @@ AI 开启时也可以用自然语言进入回避，例如“先别回复了”�
 
 - 非斜杠消息不会调用对话模型、长期记忆抽取器或 Embedding API。
 - 非斜杠消息不会写入 SQLite 短期或长期记忆，也不会自动回复。
-- `/ping`、`/help`、`/ai status` 等本地命令仍可使用。
+- 明确 @ 机器人后，`/ping`、`/help`、`/ai status` 等本地命令仍可使用。
 - 只有显式 `/ai on` 能恢复 AI；“重新打开 AI”等自然语言不会生效。
 
 状态按 `group_openid` 隔离，并保存在 SQLite 的 `group_ai_state` 表中。机器人重启后会延续各群关闭前的状态，只有显式执行 `/ai on` 才会重新开启。回避期间的内容不会在重新开启后通过历史间接发送给 AI。
@@ -167,7 +172,7 @@ export const pingCommand = Object.freeze({
 npm test
 ```
 
-覆盖 Access Token 单飞缓存、QQ 鉴权头与请求字段、引用消息标准化、SQLite 跨重启消息历史、群隔离、长期记忆抽取/更新/删除/召回、AI 回避的数据隔离与显式恢复、故障降级、命令解析、AI 工具映射、斜杠命令绕过 AI 和事件去重。
+覆盖 Access Token 单飞缓存、QQ 鉴权头与请求字段、两类群消息事件的 @ 判定、命令前 mention 标记、引用消息标准化、SQLite 跨重启消息历史、群隔离、长期记忆抽取/更新/删除/召回、AI 回避的数据隔离与显式恢复、故障降级、命令解析、AI 工具映射、斜杠命令绕过 AI 和事件去重。
 
 ## 安全与运行说明
 

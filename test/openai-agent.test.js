@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OpenAIResponsesAgent } from "../src/ai/openai-responses-agent.js";
+import { OPPORTUNISTIC_SILENCE, OpenAIResponsesAgent } from "../src/ai/openai-responses-agent.js";
 
 test("AI 函数调用的参数交给本地命令执行，并直接返回确定性结果", async () => {
   let requestedBody;
@@ -54,6 +54,56 @@ test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {
     tools: [],
     executeTool() {},
   }), { text: "你好！", route: "ai-text" });
+});
+
+test("AI 旁听模式可选择静默而不生成群聊回复", async () => {
+  let requestedBody;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create(body) {
+          requestedBody = body;
+          return { output: [], output_text: OPPORTUNISTIC_SILENCE };
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(await agent.respond({
+    message: { username: "小明", text: "今天天气不错" },
+    history: [],
+    tools: [],
+    executeTool() {},
+    engagement: "opportunistic",
+  }), { text: null, route: "ai-silent" });
+  assert.match(requestedBody.instructions, /正在旁听的群聊/);
+  assert.match(requestedBody.instructions, /KOI_NO_REPLY/);
+});
+
+test("仅 @ 机器人的空消息会提示模型结合上下文回应", async () => {
+  let requestedBody;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create(body) {
+          requestedBody = body;
+          return { output: [], output_text: "我在。" };
+        },
+      },
+    },
+  });
+
+  await agent.respond({
+    message: { username: "小明", text: "", isExplicitBotMention: true },
+    history: [{ role: "user", content: "小红：团建安排在周六" }],
+    tools: [],
+    executeTool() {},
+  });
+
+  assert.match(requestedBody.input.at(-1).content, /用户仅 @ 机器人/);
+  assert.match(requestedBody.instructions, /必须作出有帮助的回应/);
 });
 
 test("AI 输入明确区分当前消息和被引用消息", async () => {
