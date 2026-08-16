@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OpenAIResponsesAgent } from "../src/ai/openai-responses-agent.js";
+import { OpenAIResponsesAgent, SELECTIVE_SILENCE } from "../src/ai/openai-responses-agent.js";
 
 test("AI 函数调用的参数交给本地命令执行，并直接返回确定性结果", async () => {
   let requestedBody;
@@ -54,6 +54,31 @@ test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {
     tools: [],
     executeTool() {},
   }), { text: "你好！", route: "ai-text" });
+});
+
+test("AI 选择性旁听模式只有明确判断后才会回复", async () => {
+  let requestedBody;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create(body) {
+          requestedBody = body;
+          return { output: [], output_text: SELECTIVE_SILENCE };
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(await agent.respond({
+    message: { username: "小明", text: "大家觉得 Koi 的回答怎么样？" },
+    history: [],
+    tools: [],
+    executeTool() {},
+    engagement: "selective",
+  }), { text: null, route: "ai-silent" });
+  assert.match(requestedBody.instructions, /不要因为机器人名字被第三方讨论/);
+  assert.match(requestedBody.instructions, /KOI_NO_REPLY/);
 });
 
 test("仅 @ 机器人的空消息会提示模型结合上下文回应", async () => {

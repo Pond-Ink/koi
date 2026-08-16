@@ -69,7 +69,6 @@ const messageService = new MessageService({
   longTermMemory,
   botIdentityResolver: new GroupBotIdentityResolver({ qqApi }),
   aiControl: new GroupAiControl({ database }),
-  botName: persona.name,
   maxReplyChars: config.bot.maxReplyChars,
   logger,
 });

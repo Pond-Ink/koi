@@ -41,6 +41,10 @@ function replaceMentionMarkup(text, message) {
   });
 }
 
+export function formatMessageForLog(message) {
+  return replaceMentionMarkup(message.text || "", message);
+}
+
 export function formatMessageForAi(message) {
   const currentMessage = replaceMentionMarkup(currentMessageText(message), message);
   const hasMentionContext = message.isExplicitBotMention || message.mentions?.length;

@@ -1,5 +1,5 @@
 import { CommandError } from "../commands/command-registry.js";
-import { formatMessageForAi } from "../ai/message-context.js";
+import { formatMessageForAi, formatMessageForLog } from "../ai/message-context.js";
 import {
   isSupportedGroupMessageEvent,
   normalizeGroupMessageEvent,
@@ -29,14 +29,7 @@ function stripLeadingMentions(text) {
   return remaining;
 }
 
-function isExplicitTextAddressToBot(text, botName) {
-  if (!botName) return false;
-  const escapedName = botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^${escapedName}(?=\\s|[，,：:！!？?]|$)`, "iu")
-    .test(stripLeadingMentions(text));
-}
-
-function classifyMessage(message, { aiEnabled, commandPrefix, botName }) {
+function classifyMessage(message, { aiEnabled, commandPrefix }) {
   const commandText = message.isExplicitBotMention
     ? stripLeadingMentions(message.text)
     : "";
@@ -44,12 +37,10 @@ function classifyMessage(message, { aiEnabled, commandPrefix, botName }) {
     return { kind: "command", commandText };
   }
   if (!aiEnabled) return { kind: "ignored" };
-  if (message.isExplicitBotMention) return { kind: "ai", reason: "explicit-mention" };
-  if (message.replyTo?.isBot) return { kind: "ai", reason: "reply-to-bot" };
-  if (isExplicitTextAddressToBot(message.text, botName)) {
-    return { kind: "ai", reason: "explicit-text-address" };
-  }
-  return { kind: "observed" };
+  return {
+    kind: "ai",
+    engagement: message.isExplicitBotMention ? "direct" : "selective",
+  };
 }
 
 export class MessageService {
@@ -62,7 +53,6 @@ export class MessageService {
     longTermMemory = null,
     botIdentityResolver,
     aiControl,
-    botName = "",
     maxReplyChars = 1500,
     logger,
   }) {
@@ -74,7 +64,6 @@ export class MessageService {
     this.longTermMemory = longTermMemory;
     this.botIdentityResolver = botIdentityResolver;
     this.aiControl = aiControl;
-    this.botName = botName;
     this.maxReplyChars = maxReplyChars;
     this.logger = logger;
     this.groupQueues = new Map();
@@ -152,33 +141,35 @@ export class MessageService {
     const route = classifyMessage(message, {
       aiEnabled: aiWasEnabled,
       commandPrefix: this.registry.prefix,
-      botName: this.botName,
     });
     const commandContext = { message, aiControl: this.aiControl };
     const memoryContent = formatMessageForAi(message);
+    const logContent = formatMessageForLog(message);
 
     if (route.kind === "ignored") {
-      this.logger.info("AI 回避期间忽略群消息", {
-        eventType: message.type,
-        msgId: message.msgId,
+      this.logMessageHandling(message, logContent, "AI 回避期间忽略", {
         route: "ai-avoid",
       });
       return true;
     }
-    if (route.kind === "observed") {
-      return this.rememberWithoutReply(message, memoryContent, "memory-observe");
-    }
-
     let result;
     try {
       result = await this.executeRoute(route, message, commandContext);
     } catch (error) {
+      if (route.engagement === "selective") {
+        this.logger.error("旁听群消息时 AI 处理失败，已静默降级", { error, msgId: message.msgId });
+        return this.rememberWithoutReply(message, memoryContent, logContent, "ai-observe-fallback");
+      }
       if (error instanceof CommandError) {
         result = { text: `命令错误：${error.message}`, route: "command-error" };
       } else {
         this.logger.error("生成群聊回复失败", { error, msgId: message.msgId });
         result = { text: "处理消息时发生错误，请稍后重试。", route: "error" };
       }
+    }
+
+    if (route.engagement === "selective" && result.text === null) {
+      return this.rememberWithoutReply(message, memoryContent, logContent, result.route);
     }
 
     const replyChunks = await this.sendReply(message, result.text);
@@ -192,9 +183,7 @@ export class MessageService {
     const remembered = route.kind === "command" || !aiIsEnabledAfter
       ? 0
       : await this.observeLongTermMemory(message);
-    this.logger.info("群消息已处理", {
-      eventType: message.type,
-      msgId: message.msgId,
+    this.logMessageHandling(message, logContent, "已处理消息", {
       route: result.route,
       commandName: result.commandName,
       replyChunks,
@@ -217,20 +206,29 @@ export class MessageService {
       longTermMemories: await this.recallLongTermMemory(message),
       tools: this.registry.toAiTools(),
       executeTool: (name, args) => this.registry.executeTool(name, args, commandContext),
-      engagement: "direct",
+      engagement: route.engagement,
     });
   }
 
-  async rememberWithoutReply(message, memoryContent, route) {
+  async rememberWithoutReply(message, memoryContent, logContent, route) {
     await this.memory.addUserMessage(message.groupOpenid, memoryContent);
     const remembered = await this.observeLongTermMemory(message);
-    this.logger.info("群消息已静默写入记忆", {
-      eventType: message.type,
-      msgId: message.msgId,
+    this.logMessageHandling(message, logContent, "已静默写入记忆", {
       route,
       longTermOperations: remembered,
     });
     return true;
+  }
+
+  logMessageHandling(message, content, action, details = {}) {
+    this.logger.info("群消息处理", {
+      eventType: message.type,
+      msgId: message.msgId,
+      groupOpenid: message.groupOpenid,
+      content,
+      action,
+      ...details,
+    });
   }
 
   async sendReply(message, text) {
