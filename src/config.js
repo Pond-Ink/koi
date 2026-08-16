@@ -45,6 +45,18 @@ export function loadConfig({
   configUrl = new URL("../config.json", import.meta.url),
 } = {}) {
   const fileConfig = JSON.parse(readFileSync(configUrl, "utf8"));
+  const textApiKey = env.OPENAI_TEXT_API_KEY || requireValue(env, "OPENAI_API_KEY");
+  const textModel = env.OPENAI_TEXT_MODEL || requireValue(env, "OPENAI_MODEL");
+  const textBaseUrl = (
+    env.OPENAI_TEXT_BASE_URL
+    || env.OPENAI_BASE_URL
+    || "https://api.openai.com/v1"
+  ).replace(/\/$/, "");
+  const embeddingBaseUrl = (
+    env.OPENAI_EMBEDDING_BASE_URL
+    || textBaseUrl
+  ).replace(/\/$/, "");
+  const embeddingApiKey = env.OPENAI_EMBEDDING_API_KEY || textApiKey;
 
   return Object.freeze({
     qq: Object.freeze({
@@ -64,16 +76,18 @@ export function loadConfig({
       ),
     }),
     ai: Object.freeze({
-      apiKey: requireValue(env, "OPENAI_API_KEY"),
-      model: requireValue(env, "OPENAI_MODEL"),
-      baseUrl: (env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, ""),
+      apiKey: textApiKey,
+      model: textModel,
+      baseUrl: textBaseUrl,
       requestTimeoutMs: positiveInteger(fileConfig.ai.requestTimeoutMs, "ai.requestTimeoutMs"),
       maxRetries: nonNegativeInteger(fileConfig.ai.maxRetries, "ai.maxRetries"),
     }),
     memory: Object.freeze({
       databasePath: env.MEMORY_DATABASE_PATH || fileConfig.memory.databasePath,
-      extractionModel: env.OPENAI_MEMORY_MODEL || requireValue(env, "OPENAI_MODEL"),
+      extractionModel: env.OPENAI_MEMORY_MODEL || textModel,
       embeddingModel: env.OPENAI_EMBEDDING_MODEL || fileConfig.memory.embeddingModel,
+      embeddingBaseUrl,
+      embeddingApiKey,
       historyMessages: positiveInteger(
         fileConfig.memory.historyMessages,
         "memory.historyMessages",

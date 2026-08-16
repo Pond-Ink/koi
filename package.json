@@ -1,6 +1,6 @@
 {
   "name": "qq-group-ai-bot",
-  "version": "0.2.0-dev.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "QQ 群聊机器人：确定性斜杠命令与 AI 自然语言工具调用共享同一命令层",

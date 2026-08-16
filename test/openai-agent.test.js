@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OPPORTUNISTIC_SILENCE, OpenAIResponsesAgent } from "../src/ai/openai-responses-agent.js";
+import { OpenAIResponsesAgent } from "../src/ai/openai-responses-agent.js";
 
 test("AI 函数调用的参数交给本地命令执行，并直接返回确定性结果", async () => {
   let requestedBody;
@@ -56,31 +56,6 @@ test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {
   }), { text: "你好！", route: "ai-text" });
 });
 
-test("AI 旁听模式可选择静默而不生成群聊回复", async () => {
-  let requestedBody;
-  const agent = new OpenAIResponsesAgent({
-    model: "test-model",
-    client: {
-      responses: {
-        async create(body) {
-          requestedBody = body;
-          return { output: [], output_text: OPPORTUNISTIC_SILENCE };
-        },
-      },
-    },
-  });
-
-  assert.deepEqual(await agent.respond({
-    message: { username: "小明", text: "今天天气不错" },
-    history: [],
-    tools: [],
-    executeTool() {},
-    engagement: "opportunistic",
-  }), { text: null, route: "ai-silent" });
-  assert.match(requestedBody.instructions, /正在旁听的群聊/);
-  assert.match(requestedBody.instructions, /KOI_NO_REPLY/);
-});
-
 test("仅 @ 机器人的空消息会提示模型结合上下文回应", async () => {
   let requestedBody;
   const agent = new OpenAIResponsesAgent({
@@ -106,6 +81,43 @@ test("仅 @ 机器人的空消息会提示模型结合上下文回应", async ()
   assert.match(requestedBody.instructions, /必须作出有帮助的回应/);
 });
 
+test("AI 输入明确标注每个 @ 是否指向当前机器人", async () => {
+  let requestedBody;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create(body) {
+          requestedBody = body;
+          return { output: [], output_text: "pong" };
+        },
+      },
+    },
+  });
+
+  await agent.respond({
+    message: {
+      username: "凇",
+      text: "<@63C7CD6010E9762AB18F9C334F9FE49A> /ping",
+      isExplicitBotMention: true,
+      mentions: [{
+        memberOpenid: "63C7CD6010E9762AB18F9C334F9FE49A",
+        username: "Koi",
+        isBot: true,
+        isCurrentBot: true,
+      }],
+    },
+    history: [],
+    tools: [],
+    executeTool() {},
+  });
+
+  const input = requestedBody.input.at(-1).content;
+  assert.match(input, /"current_message": "@当前机器人 \/ping"/);
+  assert.match(input, /"explicitly_mentions_current_bot": true/);
+  assert.match(input, /"is_current_bot": true/);
+});
+
 test("AI 输入明确区分当前消息和被引用消息", async () => {
   let requestedBody;
   const agent = new OpenAIResponsesAgent({
@@ -127,6 +139,7 @@ test("AI 输入明确区分当前消息和被引用消息", async () => {
       replyTo: {
         messageId: "quoted-1",
         username: "小红",
+        isBot: true,
         text: "我也觉得这个方案更稳妥",
         attachments: [{ content_type: "image/png", filename: "截图.png", url: "https://example.invalid/private" }],
       },
@@ -140,6 +153,7 @@ test("AI 输入明确区分当前消息和被引用消息", async () => {
   assert.match(input, /"current_message": "这句话是什么意思？"/);
   assert.match(input, /"text": "我也觉得这个方案更稳妥"/);
   assert.match(input, /"filename": "截图.png"/);
+  assert.match(input, /"is_current_bot": true/);
   assert.doesNotMatch(input, /example\.invalid/);
   assert.match(requestedBody.instructions, /replied_message/);
 });

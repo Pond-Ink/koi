@@ -41,7 +41,9 @@ const aiAgent = new OpenAIResponsesAgent({ ...config.ai, persona });
 const database = new SqliteDatabase({ filename: config.memory.databasePath });
 const embeddings = new OpenAISdkEmbeddings({
   ...config.ai,
+  apiKey: config.memory.embeddingApiKey,
   model: config.memory.embeddingModel,
+  baseUrl: config.memory.embeddingBaseUrl,
 });
 const longTermMemory = new LongTermMemoryService({
   extractor: new LongTermMemoryExtractor({
@@ -67,6 +69,7 @@ const messageService = new MessageService({
   longTermMemory,
   botIdentityResolver: new GroupBotIdentityResolver({ qqApi }),
   aiControl: new GroupAiControl({ database }),
+  botName: persona.name,
   maxReplyChars: config.bot.maxReplyChars,
   logger,
 });

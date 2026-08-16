@@ -29,7 +29,14 @@ function stripLeadingMentions(text) {
   return remaining;
 }
 
-function classifyMessage(message, { aiEnabled, commandPrefix }) {
+function isExplicitTextAddressToBot(text, botName) {
+  if (!botName) return false;
+  const escapedName = botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escapedName}(?=\\s|[，,：:！!？?]|$)`, "iu")
+    .test(stripLeadingMentions(text));
+}
+
+function classifyMessage(message, { aiEnabled, commandPrefix, botName }) {
   const commandText = message.isExplicitBotMention
     ? stripLeadingMentions(message.text)
     : "";
@@ -37,10 +44,12 @@ function classifyMessage(message, { aiEnabled, commandPrefix }) {
     return { kind: "command", commandText };
   }
   if (!aiEnabled) return { kind: "ignored" };
-  return {
-    kind: "ai",
-    engagement: message.isExplicitBotMention ? "direct" : "opportunistic",
-  };
+  if (message.isExplicitBotMention) return { kind: "ai", reason: "explicit-mention" };
+  if (message.replyTo?.isBot) return { kind: "ai", reason: "reply-to-bot" };
+  if (isExplicitTextAddressToBot(message.text, botName)) {
+    return { kind: "ai", reason: "explicit-text-address" };
+  }
+  return { kind: "observed" };
 }
 
 export class MessageService {
@@ -53,6 +62,7 @@ export class MessageService {
     longTermMemory = null,
     botIdentityResolver,
     aiControl,
+    botName = "",
     maxReplyChars = 1500,
     logger,
   }) {
@@ -64,6 +74,7 @@ export class MessageService {
     this.longTermMemory = longTermMemory;
     this.botIdentityResolver = botIdentityResolver;
     this.aiControl = aiControl;
+    this.botName = botName;
     this.maxReplyChars = maxReplyChars;
     this.logger = logger;
     this.groupQueues = new Map();
@@ -141,6 +152,7 @@ export class MessageService {
     const route = classifyMessage(message, {
       aiEnabled: aiWasEnabled,
       commandPrefix: this.registry.prefix,
+      botName: this.botName,
     });
     const commandContext = { message, aiControl: this.aiControl };
     const memoryContent = formatMessageForAi(message);
@@ -153,25 +165,20 @@ export class MessageService {
       });
       return true;
     }
+    if (route.kind === "observed") {
+      return this.rememberWithoutReply(message, memoryContent, "memory-observe");
+    }
 
     let result;
     try {
       result = await this.executeRoute(route, message, commandContext);
     } catch (error) {
-      if (route.kind === "ai" && route.engagement === "opportunistic") {
-        this.logger.error("旁听群消息时 AI 处理失败，已静默降级", { error, msgId: message.msgId });
-        return this.rememberWithoutReply(message, memoryContent, "ai-observe-fallback");
-      }
       if (error instanceof CommandError) {
         result = { text: `命令错误：${error.message}`, route: "command-error" };
       } else {
         this.logger.error("生成群聊回复失败", { error, msgId: message.msgId });
         result = { text: "处理消息时发生错误，请稍后重试。", route: "error" };
       }
-    }
-
-    if (route.kind === "ai" && result.text === null) {
-      return this.rememberWithoutReply(message, memoryContent, result.route);
     }
 
     const replyChunks = await this.sendReply(message, result.text);
@@ -210,7 +217,7 @@ export class MessageService {
       longTermMemories: await this.recallLongTermMemory(message),
       tools: this.registry.toAiTools(),
       executeTool: (name, args) => this.registry.executeTool(name, args, commandContext),
-      engagement: route.engagement,
+      engagement: "direct",
     });
   }
 

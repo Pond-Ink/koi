@@ -80,17 +80,26 @@ function normalizeReplyTo(message) {
   return Object.freeze({
     messageId: referenceIndex,
     username: author.username || author.nickname || null,
+    isBot: Boolean(author.bot || author.is_you),
     text: text || null,
     attachments,
   });
 }
 
-function hasExplicitBotMention(message, botMemberOpenid) {
-  if (!botMemberOpenid || !Array.isArray(message.mentions)) return false;
-  return message.mentions.some((mention) => (
-    mention?.member_openid !== undefined
-    && String(mention.member_openid) === String(botMemberOpenid)
-  ));
+function normalizeMentions(mentions, botMemberOpenid) {
+  if (!Array.isArray(mentions)) return [];
+  return mentions.map((mention) => {
+    const memberOpenid = mention?.member_openid === undefined
+      ? null
+      : String(mention.member_openid);
+    return Object.freeze({
+      memberOpenid,
+      username: mention?.username || "群成员",
+      isBot: Boolean(mention?.bot),
+      isCurrentBot: mention?.is_you === true
+        || (Boolean(botMemberOpenid) && memberOpenid === String(botMemberOpenid)),
+    });
+  });
 }
 
 export function normalizeGroupMessageEvent(
@@ -105,8 +114,9 @@ export function normalizeGroupMessageEvent(
     message.content?.trim()
     || collectCurrentElementText(message, replyTo?.messageId)
   ).trim();
+  const mentions = normalizeMentions(message.mentions, botMemberOpenid);
   const isExplicitBotMention = payload.t === "GROUP_AT_MESSAGE_CREATE"
-    || hasExplicitBotMention(message, botMemberOpenid);
+    || mentions.some((mention) => mention.isCurrentBot);
   if (!text && !isExplicitBotMention) return null;
 
   const msgIndex = findMessageIndex(message);
@@ -120,6 +130,7 @@ export function normalizeGroupMessageEvent(
     username: message.author?.username || "群成员",
     text,
     isExplicitBotMention,
+    mentions,
     replyTo,
     dedupKey: String(payload.id || `${message.id}:${msgIndex}`),
   });

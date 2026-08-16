@@ -27,7 +27,12 @@ function payload({ id, content }) {
 
 function createService(
   aiAgent,
-  { longTermMemory = null, botMemberOpenid = "bot-member-openid", botIdentityResolver } = {},
+  {
+    longTermMemory = null,
+    botMemberOpenid = "bot-member-openid",
+    botIdentityResolver,
+    botName = "Koi",
+  } = {},
 ) {
   const sent = [];
   const memory = new LangChainGroupMemory();
@@ -46,6 +51,7 @@ function createService(
         return botMemberOpenid;
       },
     },
+    botName,
     logger,
   });
   return { service, sent, memory, aiControl };
@@ -172,12 +178,12 @@ test("引用内容不会改变斜杠命令的确定性路由", async () => {
   assert.equal(sent[0].content, "pong");
 });
 
-test("全量群消息由 AI 静默旁听并写入记忆，后续明确 @ 可读取上下文", async () => {
+test("未明确面向机器人的全量群消息只写入记忆，后续明确 @ 可读取上下文", async () => {
   const seenHistories = [];
   const aiAgent = {
     async respond({ history, engagement }) {
       seenHistories.push(history);
-      if (engagement === "opportunistic") return { text: null, route: "ai-silent" };
+      assert.equal(engagement, "direct");
       return { text: "ok", route: "ai-text" };
     },
   };
@@ -188,11 +194,11 @@ test("全量群消息由 AI 静默旁听并写入记忆，后续明确 @ 可读�
   observed.d.mentions = [];
   await service.handleGatewayPayload(observed);
   assert.equal(sent.length, 0);
-  assert.deepEqual(seenHistories[0], []);
+  assert.deepEqual(seenHistories, []);
 
   await service.handleGatewayPayload(payload({ id: "msg-6", content: "刚才说去哪？" }));
   assert.equal(sent.length, 1);
-  assert.deepEqual(seenHistories[1], [
+  assert.deepEqual(seenHistories[0], [
     { role: "user", content: "小明：下周团建去杭州" },
   ]);
 });
@@ -220,7 +226,6 @@ test("全量群消息中只有 @ 机器人时结合已有上下文回复", async
   const { service, sent } = createService({
     async respond(input) {
       calls.push(input);
-      if (input.engagement === "opportunistic") return { text: null, route: "ai-silent" };
       return { text: "刚才在讨论周六的团建。", route: "ai-text" };
     },
   });
@@ -235,21 +240,21 @@ test("全量群消息中只有 @ 机器人时结合已有上下文回复", async
   onlyMention.d.mentions = [{ member_openid: "bot-member-openid", bot: true, username: "Koi" }];
   await service.handleGatewayPayload(onlyMention);
 
-  assert.equal(calls[1].engagement, "direct");
-  assert.equal(calls[1].message.text, "");
-  assert.deepEqual(calls[1].history, [
+  assert.equal(calls[0].engagement, "direct");
+  assert.equal(calls[0].message.text, "");
+  assert.deepEqual(calls[0].history, [
     { role: "user", content: "小明：团建改到周六" },
   ]);
   assert.equal(sent[0].content, "刚才在讨论周六的团建。");
 });
 
-test("全量群消息提及机器人名字时由 AI 择机发言", async () => {
+test("文本开头明确称呼机器人时进入回复路径", async () => {
   const event = payload({ id: "msg-name", content: "Koi，你怎么看？" });
   event.t = "GROUP_MESSAGE_CREATE";
   event.d.mentions = [];
   const { service, sent } = createService({
     async respond({ engagement, message }) {
-      assert.equal(engagement, "opportunistic");
+      assert.equal(engagement, "direct");
       assert.equal(message.text, "Koi，你怎么看？");
       return { text: "我倾向于先确认时间。", route: "ai-text" };
     },
@@ -260,12 +265,53 @@ test("全量群消息提及机器人名字时由 AI 择机发言", async () => {
   assert.equal(sent[0].content, "我倾向于先确认时间。");
 });
 
+test("讨论机器人但未明确面向机器人时只写入记忆", async () => {
+  const event = payload({ id: "msg-about-bot", content: "大家觉得 Koi 的回答怎么样？" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  const { service, sent, memory } = createService({
+    async respond() {
+      assert.fail("未直接面向机器人时不应调用对话模型");
+    },
+  });
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(sent.length, 0);
+  assert.deepEqual(await memory.get("group-1"), [
+    { role: "user", content: "小明：大家觉得 Koi 的回答怎么样？" },
+  ]);
+});
+
+test("明确回复机器人消息时进入回复路径", async () => {
+  const event = payload({ id: "msg-reply-bot", content: "这个建议可以，继续说。" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  event.d.message_scene.ext.push("ref_msg_idx=bot-message");
+  event.d.msg_elements = [{
+    msg_idx: "bot-message",
+    content: "可以考虑周六出发。",
+    author: { username: "Koi", bot: true },
+  }];
+  const { service, sent } = createService({
+    async respond({ engagement, message }) {
+      assert.equal(engagement, "direct");
+      assert.equal(message.replyTo.isBot, true);
+      return { text: "好，我再补充具体安排。", route: "ai-text" };
+    },
+  });
+
+  await service.handleGatewayPayload(event);
+
+  assert.equal(sent[0].content, "好，我再补充具体安排。");
+});
+
 test("全量群消息中只有明确 @ 当前机器人时才直接执行斜杠命令", async () => {
   let aiCalls = 0;
   const aiAgent = {
     async respond() {
       aiCalls += 1;
-      return { text: null, route: "ai-silent" };
+      return { text: "不应调用", route: "ai-text" };
     },
   };
   const { service, sent } = createService(aiAgent, { botMemberOpenid: "current-member" });
@@ -281,7 +327,7 @@ test("全量群消息中只有明确 @ 当前机器人时才直接执行斜杠�
 
   await service.handleGatewayPayload(event);
 
-  assert.equal(aiCalls, 1);
+  assert.equal(aiCalls, 0);
   assert.equal(sent[0].content, "pong");
 });
 
