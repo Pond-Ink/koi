@@ -31,6 +31,7 @@ test("文本处理与 Embedding 可使用不同的模型和 BASE_URL", () => {
   assert.equal(config.ai.apiKey, "text-api-key");
   assert.equal(config.ai.model, "text-model");
   assert.equal(config.ai.baseUrl, "https://text-provider.example/v1");
+  assert.equal(config.ai.reasoningEffort, "high");
   assert.equal(config.memory.extractionModel, "memory-model");
   assert.equal(config.memory.embeddingModel, "embedding-model");
   assert.equal(config.memory.embeddingBaseUrl, "https://embedding-provider.example/v1");
@@ -46,4 +47,18 @@ test("未配置专用地址时 Embedding 沿用文本处理配置", () => {
   assert.equal(config.memory.extractionModel, "text-default");
   assert.equal(config.memory.embeddingBaseUrl, "https://text.example/v1");
   assert.equal(config.memory.embeddingApiKey, "api-key");
+});
+
+test("推理强度可由环境变量覆盖", () => {
+  assert.equal(
+    loadConfig({ env: baseEnv({ OPENAI_REASONING_EFFORT: "low" }) }).ai.reasoningEffort,
+    "low",
+  );
+
+  const configUrl = new URL("../config.json", import.meta.url);
+  const config = loadConfig({
+    env: baseEnv(),
+    configUrl,
+  });
+  assert.equal(config.ai.reasoningEffort, "high");
 });

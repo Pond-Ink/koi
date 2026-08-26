@@ -32,8 +32,34 @@ test("AI 函数调用的参数交给本地命令执行，并直接返回确定�
 
   assert.equal(requestedBody.store, false);
   assert.equal(requestedBody.parallel_tool_calls, false);
+  assert.equal(requestedBody.reasoning, undefined);
   assert.deepEqual(executed, { name: "command_ping", args: {} });
   assert.deepEqual(result, { text: "pong", commandName: "ping", route: "ai-tool" });
+});
+
+test("AI 请求使用配置的推理强度", async () => {
+  let requestedBody;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    reasoningEffort: "high",
+    client: {
+      responses: {
+        async create(body) {
+          requestedBody = body;
+          return { output: [], output_text: "收到" };
+        },
+      },
+    },
+  });
+
+  await agent.respond({
+    message: { username: "小明", text: "你好" },
+    history: [],
+    tools: [],
+    executeTool() {},
+  });
+
+  assert.deepEqual(requestedBody.reasoning, { effort: "high" });
 });
 
 test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {

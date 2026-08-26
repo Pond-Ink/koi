@@ -128,6 +128,9 @@ AI 开启时也可以用自然语言进入回避，例如“先别回复了”�
    Embedding 默认沿用文本 BASE_URL，模型来自 `config.json` 的
    `memory.embeddingModel`；可用 `OPENAI_EMBEDDING_MODEL`、
    `OPENAI_EMBEDDING_BASE_URL`、`OPENAI_EMBEDDING_API_KEY` 分别覆盖，因而可接入不同的兼容服务。
+   群聊回复模型的推理强度默认由 `config.json` 中的 `ai.reasoningEffort` 控制；可用
+   `OPENAI_REASONING_EFFORT` 覆盖。支持 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`；
+   将 `config.json` 的该值设为 `null` 可不向 API 发送 `reasoning` 参数。
    `OPENAI_MEMORY_MODEL` 可单独覆盖长期记忆抽取模型；`MEMORY_DATABASE_PATH`
    和 `PERSONA_CONFIG_PATH` 分别覆盖数据库与人格配置路径。
 4. 在 QQ 开放平台为机器人启用群聊事件，订阅 `GROUP_AND_C2C_EVENT (1 << 25)`。若要让机器人关注未 @ 它的群聊内容，还需申请并启用 `GROUP_MESSAGE_CREATE` 全量群消息事件；没有该权限时仍可使用 `GROUP_AT_MESSAGE_CREATE`。

@@ -8,6 +8,8 @@ export class ConfigurationError extends Error {
   }
 }
 
+const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
 function requireValue(env, name) {
   const value = env[name]?.trim();
   if (!value) {
@@ -38,6 +40,16 @@ function fraction(value, name) {
     throw new ConfigurationError(`${name} 必须是 0 到 1 之间的数字`);
   }
   return parsed;
+}
+
+function optionalReasoningEffort(value, name) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || !REASONING_EFFORTS.has(value.trim())) {
+    throw new ConfigurationError(
+      `${name} 必须是 ${[...REASONING_EFFORTS].join("、")} 之一，或为 null`,
+    );
+  }
+  return value.trim();
 }
 
 export function loadConfig({
@@ -81,6 +93,10 @@ export function loadConfig({
       baseUrl: textBaseUrl,
       requestTimeoutMs: positiveInteger(fileConfig.ai.requestTimeoutMs, "ai.requestTimeoutMs"),
       maxRetries: nonNegativeInteger(fileConfig.ai.maxRetries, "ai.maxRetries"),
+      reasoningEffort: optionalReasoningEffort(
+        env.OPENAI_REASONING_EFFORT ?? fileConfig.ai.reasoningEffort,
+        "OPENAI_REASONING_EFFORT",
+      ),
     }),
     memory: Object.freeze({
       databasePath: env.MEMORY_DATABASE_PATH || fileConfig.memory.databasePath,

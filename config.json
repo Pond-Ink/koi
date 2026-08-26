@@ -8,7 +8,8 @@
   },
   "ai": {
     "requestTimeoutMs": 30000,
-    "maxRetries": 2
+    "maxRetries": 2,
+    "reasoningEffort": "high"
   },
   "memory": {
     "databasePath": "./data/koi.sqlite",

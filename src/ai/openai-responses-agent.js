@@ -55,10 +55,12 @@ export class OpenAIResponsesAgent {
     baseUrl,
     requestTimeoutMs = 30_000,
     maxRetries = 2,
+    reasoningEffort = null,
     persona = DEFAULT_PERSONA,
     client,
   }) {
     this.model = model;
+    this.reasoningEffort = reasoningEffort;
     this.instructions = buildAgentInstructions(persona);
     this.client = client || new OpenAI({
       apiKey,
@@ -92,6 +94,7 @@ export class OpenAIResponsesAgent {
         tools,
         tool_choice: "auto",
         parallel_tool_calls: false,
+        ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
       });
     } catch (error) {
       throw new OpenAIResponsesError("OpenAI Responses API 调用失败", {
