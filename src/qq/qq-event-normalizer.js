@@ -1,4 +1,5 @@
 const SUPPORTED_EVENTS = new Set(["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"]);
+const IMAGE_EXTENSION = /\.(jpe?g|png|gif|webp)$/i;
 
 export function isSupportedGroupMessageEvent(payload) {
   return payload?.op === 0
@@ -33,48 +34,68 @@ function findReferenceIndex(message) {
     : String(direct);
 }
 
-function collectElementText(elements = []) {
-  return elements
-    .flatMap((element) => [element.content, collectElementText(element.msg_elements)])
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+function flattenElements(elements, excluded) {
+  if (!Array.isArray(elements)) return [];
+  return elements.flatMap((element) => (
+    element && element !== excluded
+      ? [element, ...flattenElements(element.msg_elements, excluded)]
+      : []
+  ));
 }
 
-function findElementByIndex(elements = [], index) {
-  for (const element of elements) {
-    if (index && String(element.msg_idx ?? "") === index) return element;
-    const nested = findElementByIndex(element.msg_elements, index);
-    if (nested) return nested;
+function findElementByIndex(elements, index) {
+  return index ? elements.find((element) => String(element.msg_idx ?? "") === index) : null;
+}
+
+function collectElementText(elements) {
+  return elements.map((element) => element.content).filter(Boolean).join("\n").trim();
+}
+
+function getAttachments(message) {
+  return Array.isArray(message.attachments) ? message.attachments.filter(Boolean) : [];
+}
+
+function getImageUrls(attachments) {
+  const urls = new Set();
+  for (const attachment of attachments) {
+    if (typeof attachment.url !== "string") continue;
+    const raw = attachment.url.trim();
+    const imageUrl = raw.startsWith("//") ? `https:${raw}` : raw;
+    const url = URL.parse(imageUrl);
+    if (!url || !/^https?:\/\//i.test(imageUrl) || url.username || url.password) continue;
+
+    const type = String(attachment.content_type || attachment.type || "").trim().toLowerCase();
+    const hasImageExtension = IMAGE_EXTENSION.test(attachment.filename || "")
+      || IMAGE_EXTENSION.test(url.pathname);
+    if (type === "image" || type.startsWith("image/")
+      || ((!type || type === "application/octet-stream") && hasImageExtension)) {
+      urls.add(imageUrl);
+    }
   }
-  return null;
+  return [...urls];
 }
 
-function collectCurrentElementText(message, referenceIndex) {
-  const currentIndex = findMessageIndex(message);
-  const currentElement = findElementByIndex(message.msg_elements, currentIndex);
-  if (currentElement && currentIndex !== referenceIndex) {
-    return collectElementText([currentElement]);
-  }
-
-  return collectElementText(
-    (message.msg_elements || []).filter((element) => (
-      !referenceIndex || String(element.msg_idx ?? "") !== referenceIndex
-    )),
-  );
-}
-
-function normalizeReplyTo(message) {
-  const referenceIndex = findReferenceIndex(message);
+function findReferenceElement(message, referenceIndex, currentIndex) {
   if (!referenceIndex) return null;
 
   const hasEmbeddedReference = message.ref_msg_idx !== undefined
     || Boolean(findSceneValue(message, "ref_msg_idx"));
-  const referenceElement = findElementByIndex(message.msg_elements, referenceIndex)
-    || (hasEmbeddedReference ? message.msg_elements?.[0] : null)
-    || null;
-  const text = referenceElement ? collectElementText([referenceElement]) : "";
-  const attachments = referenceElement?.attachments || [];
+  const matched = findElementByIndex(flattenElements(message.msg_elements), referenceIndex);
+  if (matched) return matched;
+
+  const first = message.msg_elements?.[0];
+  if (!hasEmbeddedReference || !first || (currentIndex && String(first.msg_idx) === currentIndex)) {
+    return null;
+  }
+  return first;
+}
+
+function normalizeReplyTo(referenceIndex, referenceElement) {
+  if (!referenceIndex) return null;
+
+  const elements = flattenElements([referenceElement]);
+  const text = collectElementText(elements);
+  const attachments = elements.flatMap(getAttachments);
   const author = referenceElement?.author || referenceElement?.member || {};
 
   return Object.freeze({
@@ -83,6 +104,7 @@ function normalizeReplyTo(message) {
     isBot: Boolean(author.bot || author.is_you),
     text: text || null,
     attachments,
+    imageUrls: getImageUrls(attachments),
   });
 }
 
@@ -110,17 +132,22 @@ export function normalizeGroupMessageEvent(
   const message = payload.d;
   const groupOpenid = String(message.group_openid);
 
-  const replyTo = normalizeReplyTo(message);
-  const text = (
-    message.content?.trim()
-    || collectCurrentElementText(message, replyTo?.messageId)
-  ).trim();
+  const msgIndex = findMessageIndex(message);
+  const referenceIndex = findReferenceIndex(message);
+  const referenceElement = findReferenceElement(message, referenceIndex, msgIndex);
+  const replyTo = normalizeReplyTo(referenceIndex, referenceElement);
+  const elements = flattenElements(message.msg_elements, referenceElement);
+  const currentElement = findElementByIndex(elements, msgIndex);
+  const currentElements = currentElement ? flattenElements([currentElement], referenceElement) : elements;
+  const text = message.content?.trim() || collectElementText(currentElements);
+  const imageUrls = getImageUrls([
+    ...getAttachments(message),
+    ...elements.flatMap(getAttachments),
+  ]);
   const mentions = normalizeMentions(message.mentions, botMemberOpenid);
   const isExplicitBotMention = payload.t === "GROUP_AT_MESSAGE_CREATE"
     || mentions.some((mention) => mention.isCurrentBot);
-  if (!text && !isExplicitBotMention) return null;
-
-  const msgIndex = findMessageIndex(message);
+  if (!text && !imageUrls.length && !replyTo?.imageUrls.length && !isExplicitBotMention) return null;
 
   return Object.freeze({
     type: payload.t,
@@ -130,6 +157,7 @@ export function normalizeGroupMessageEvent(
     memberOpenid: String(message.author?.member_openid || message.author?.id || "unknown"),
     username: message.author?.username || "群成员",
     text,
+    imageUrls,
     isExplicitBotMention,
     mentions,
     replyTo,

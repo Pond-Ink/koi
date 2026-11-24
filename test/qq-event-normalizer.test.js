@@ -41,6 +41,7 @@ test("标准化群聊引用消息，且引用正文不混入当前正文", () =>
     isBot: false,
     text: "被引用的消息",
     attachments: [{ content_type: "image/png", filename: "图.png" }],
+    imageUrls: [],
   });
 });
 
@@ -61,7 +62,40 @@ test("仅有引用 ID 时仍向下游保留引用关系", () => {
     isBot: false,
     text: null,
     attachments: [],
+    imageUrls: [],
   });
+});
+
+test("提取群消息及引用中的图片 URL，并区分图片来源", () => {
+  const event = quotePayload();
+  event.d.content = "";
+  event.d.attachments = [
+    { content_type: "image/jpeg", url: "//example.invalid/current.jpg?key=1" },
+    { content_type: "audio/mp3", url: "https://example.invalid/audio.mp3" },
+    { content_type: "image/png", url: "file:///tmp/image.png" },
+  ];
+  const [quoted, current] = event.d.msg_elements;
+  quoted.attachments = [{ content_type: "image/png", url: "https://example.invalid/quoted.png" }];
+  current.content = "";
+  current.msg_elements = [{
+    attachments: [
+      { content_type: "image/jpeg", url: "https://example.invalid/current.jpg?key=1" },
+      { filename: "extra.WEBP", url: "https://example.invalid/attachment?key=2" },
+    ],
+  }];
+  event.d.msg_elements.push({
+    attachments: [{ content_type: "image/gif", url: "https://example.invalid/sibling.gif" }],
+  });
+
+  const message = normalizeGroupMessageEvent(event);
+
+  assert.equal(message.text, "");
+  assert.deepEqual(message.imageUrls, [
+    "https://example.invalid/current.jpg?key=1",
+    "https://example.invalid/attachment?key=2",
+    "https://example.invalid/sibling.gif",
+  ]);
+  assert.deepEqual(message.replyTo.imageUrls, ["https://example.invalid/quoted.png"]);
 });
 
 test("全量群消息通过 mentions 标记明确 @ 机器人，且允许只有 @", () => {

@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { formatLongTermMemoriesForAi, formatMessageForAi } from "./message-context.js";
+import { formatLongTermMemoriesForAi, formatMessageInput } from "./message-context.js";
 import { buildAgentInstructions } from "../persona/prompt-builder.js";
 
 const DEFAULT_PERSONA = Object.freeze({
@@ -82,7 +82,7 @@ export class OpenAIResponsesAgent {
     const input = [
       ...history,
       ...(recalledMemory ? [{ role: "developer", content: recalledMemory }] : []),
-      { role: "user", content: formatMessageForAi(message) },
+      { role: "user", content: formatMessageInput(message) },
     ];
     let response;
     try {

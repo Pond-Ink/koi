@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { OpenAIResponsesAgent, SELECTIVE_SILENCE } from "../src/ai/openai-responses-agent.js";
 import { EventDeduplicator } from "../src/app/event-deduplicator.js";
 import { LangChainGroupMemory } from "../src/app/langchain-group-memory.js";
 import { GroupAiControl } from "../src/app/group-ai-control.js";
@@ -59,10 +60,44 @@ function createService(
 test("斜杠命令绕过 AI", async () => {
   let aiCalls = 0;
   const { service, sent } = createService({ async respond() { aiCalls += 1; } });
-  await service.handleGatewayPayload(payload({ id: "msg-1", content: " /ping " }));
+  const event = payload({ id: "msg-1", content: " /ping " });
+  event.d.attachments = [{ content_type: "image/png", url: "https://example.invalid/image.png" }];
+  await service.handleGatewayPayload(event);
   assert.equal(aiCalls, 0);
   assert.equal(sent[0].content, "pong");
   assert.equal(sent[0].msgId, "msg-1");
+});
+
+test("纯图片群消息进入 Responses API，群聊历史只保留图片数量", async () => {
+  const imageUrl = "https://example.invalid/image.png?token=temporary";
+  const event = payload({ id: "image-only", content: "" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  event.d.attachments = [{ content_type: "image/png", url: imageUrl }];
+  let request;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create(body) {
+          request = body;
+          return { output_text: SELECTIVE_SILENCE };
+        },
+      },
+    },
+  });
+  const { service, sent, memory } = createService(agent);
+
+  assert.equal(await service.handleGatewayPayload(event), true);
+
+  const [text, image] = request.input.at(-1).content;
+  assert.match(text.text, /"current_message": ""/);
+  assert.match(text.text, /"current_image_count": 1/);
+  assert.deepEqual(image, { type: "input_image", image_url: imageUrl, detail: "auto" });
+  assert.equal(sent.length, 0);
+  const [remembered] = await memory.get("group-1");
+  assert.match(remembered.content, /"current_image_count": 1/);
+  assert.doesNotMatch(remembered.content, /example\.invalid/);
 });
 
 test("AT 事件不依赖 mentions 或群状态接口即可执行手写命令", async () => {

@@ -7,6 +7,7 @@ function summarizeAttachments(attachments = []) {
 
 function currentMessageText(message) {
   if (message.text) return message.text;
+  if (message.imageUrls?.length || message.replyTo?.imageUrls?.length) return "";
   if (message.isExplicitBotMention) {
     return "[用户仅 @ 机器人，未附带文字；请结合最近群聊上下文自然回应。]";
   }
@@ -48,11 +49,15 @@ export function formatMessageForLog(message) {
 export function formatMessageForAi(message) {
   const currentMessage = replaceMentionMarkup(currentMessageText(message), message);
   const hasMentionContext = message.isExplicitBotMention || message.mentions?.length;
-  if (!message.replyTo && !hasMentionContext) return `${message.username}：${currentMessage}`;
+  const imageCount = message.imageUrls?.length;
+  if (!message.replyTo && !hasMentionContext && !imageCount) {
+    return `${message.username}：${currentMessage}`;
+  }
 
   return `以下是当前群聊消息的结构化数据：\n${JSON.stringify({
     sender: message.username,
     current_message: currentMessage,
+    ...(imageCount ? { current_image_count: imageCount } : {}),
     explicitly_mentions_current_bot: Boolean(message.isExplicitBotMention),
     mentioned_users: formatMentions(message),
     ...(message.replyTo ? {
@@ -62,10 +67,24 @@ export function formatMessageForAi(message) {
         is_current_bot: Boolean(message.replyTo.isBot),
         text: message.replyTo.text,
         attachments: summarizeAttachments(message.replyTo.attachments),
-        content_available: Boolean(message.replyTo.text || message.replyTo.attachments?.length),
+        ...(message.replyTo.imageUrls?.length ? { image_count: message.replyTo.imageUrls.length } : {}),
+        content_available: Boolean(
+          message.replyTo.text || message.replyTo.attachments?.length || message.replyTo.imageUrls?.length,
+        ),
       },
     } : {}),
   }, null, 2)}`;
+}
+
+export function formatMessageInput(message) {
+  const text = formatMessageForAi(message);
+  const imageUrls = [...(message.imageUrls || []), ...(message.replyTo?.imageUrls || [])];
+  if (!imageUrls.length) return text;
+
+  return [
+    { type: "input_text", text: `${text}\n图片按当前消息、引用消息的顺序排列，数量见对应字段。` },
+    ...imageUrls.map((url) => ({ type: "input_image", image_url: url, detail: "auto" })),
+  ];
 }
 
 export function formatLongTermMemoriesForAi(memories = []) {

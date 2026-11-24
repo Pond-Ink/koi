@@ -187,12 +187,14 @@ test("AI 输入明确区分当前消息和被引用消息", async () => {
     message: {
       username: "小明",
       text: "这句话是什么意思？",
+      imageUrls: ["https://example.invalid/current.png"],
       replyTo: {
         messageId: "quoted-1",
         username: "小红",
         isBot: true,
         text: "我也觉得这个方案更稳妥",
         attachments: [{ content_type: "image/png", filename: "截图.png", url: "https://example.invalid/private" }],
+        imageUrls: ["https://example.invalid/private"],
       },
     },
     history: [],
@@ -200,12 +202,19 @@ test("AI 输入明确区分当前消息和被引用消息", async () => {
     executeTool() {},
   });
 
-  const input = requestedBody.input.at(-1).content;
-  assert.match(input, /"current_message": "这句话是什么意思？"/);
-  assert.match(input, /"text": "我也觉得这个方案更稳妥"/);
-  assert.match(input, /"filename": "截图.png"/);
-  assert.match(input, /"is_current_bot": true/);
-  assert.doesNotMatch(input, /example\.invalid/);
+  const [input, ...images] = requestedBody.input.at(-1).content;
+  assert.equal(input.type, "input_text");
+  assert.match(input.text, /"current_message": "这句话是什么意思？"/);
+  assert.match(input.text, /"current_image_count": 1/);
+  assert.match(input.text, /"text": "我也觉得这个方案更稳妥"/);
+  assert.match(input.text, /"filename": "截图.png"/);
+  assert.match(input.text, /"image_count": 1/);
+  assert.match(input.text, /"is_current_bot": true/);
+  assert.doesNotMatch(input.text, /example\.invalid/);
+  assert.deepEqual(images, [
+    { type: "input_image", image_url: "https://example.invalid/current.png", detail: "auto" },
+    { type: "input_image", image_url: "https://example.invalid/private", detail: "auto" },
+  ]);
   assert.match(requestedBody.instructions, /replied_message/);
 });
 

@@ -70,7 +70,7 @@ export class MessageService {
   }
 
   async observeLongTermMemory(message) {
-    if (!this.longTermMemory) return 0;
+    if (!this.longTermMemory || !message.text) return 0;
     try {
       return await this.longTermMemory.observe(message);
     } catch (error) {
