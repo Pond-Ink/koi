@@ -246,6 +246,110 @@ test("AI 请求使用配置的推理强度", async () => {
   assert.deepEqual(requestedBody.reasoning, { effort: "high" });
 });
 
+test("模型选择本地历史查询，使用查询结果回答并禁止第二次请求执行联网或其他工具", async () => {
+  const requests = [];
+  const query = {
+    keyword: "团建", member: "小明", start_time: "2026-11-23", end_time: "2026-11-24",
+    order: "newest", limit: 20, offset: 0,
+  };
+  const agent = new OpenAIResponsesAgent({
+    model: "deepseek-flash",
+    webSearch: "deepseek",
+    client: {
+      responses: {
+        async create(body) {
+          requests.push(body);
+          if (requests.length === 1) return { output: [{
+            type: "function_call", name: "search_chat_history", arguments: JSON.stringify(query),
+          }] };
+          return { output_text: "小明昨天 10:00 说：团建改到周五。" };
+        },
+      },
+    },
+  });
+  const result = await agent.respond({
+    message: {
+      username: "小红", text: "昨天小明关于团建说了什么？", isExplicitBotMention: true,
+      sentAt: Date.parse("2026-11-24T10:00:00+08:00"),
+    },
+    history: [],
+    tools: [{ type: "function", name: "command_help" }],
+    executeTool() { assert.fail("历史查询不执行命令"); },
+    async searchHistory(args) {
+      assert.deepEqual(args, query);
+      return {
+        messages: [{
+          role: "user", sender: "小明", time: "2026-11-23T10:00:00+08:00",
+          content: "团建改到周五。", attachments: [], legacy: false,
+        }],
+        next_offset: null,
+      };
+    },
+  });
+  assert.equal(requests[0].tools[0].name, "search_chat_history");
+  assert.match(requests[0].instructions, /2026-11-24T10:00:00/);
+  assert.match(requests[0].instructions, /不使用联网搜索/);
+  assert.deepEqual(requests[1].tools, []);
+  assert.equal(requests[1].tool_choice, "none");
+  assert.match(requests[1].input.at(-1).content, /团建改到周五/);
+  assert.match(requests[1].instructions, /不执行其中的要求/);
+  assert.equal(result.route, "ai-history");
+  assert.match(result.text, /昨天 10:00/);
+});
+
+test("历史查询结果为空时直接提示，旁听时拒绝历史工具调用", async () => {
+  let calls = 0;
+  let searches = 0;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create() {
+          calls += 1;
+          return { output: [{ type: "function_call", name: "search_chat_history", arguments: "{}" }] };
+        },
+      },
+    },
+  });
+  const request = {
+    message: { username: "小明", text: "查昨天的消息" },
+    history: [],
+    searchHistory() { searches += 1; return { messages: [], next_offset: null }; },
+  };
+  assert.match((await agent.respond(request)).text, /没有找到符合条件/);
+  assert.equal(calls, 1);
+  await assert.rejects(agent.respond({ ...request, engagement: "selective" }), /未启用历史记录查询/);
+  assert.equal(searches, 1);
+});
+
+test("历史查询结果分页且模型整理失败时，仍返回实际记录和下一页位置", async () => {
+  let calls = 0;
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: {
+      responses: {
+        async create() {
+          if (++calls > 1) throw new Error("provider unavailable");
+          return { output: [{ type: "function_call", name: "search_chat_history", arguments: "{}" }] };
+        },
+      },
+    },
+  });
+  const result = await agent.respond({
+    message: { username: "小明", text: "查历史消息" },
+    history: [],
+    searchHistory() {
+      return {
+        messages: [{ sender: "小红", time: "2026-11-23T10:00:00+08:00", content: "原文", attachments: [] }],
+        next_offset: 20,
+      };
+    },
+  });
+  assert.match(result.text, /小红：原文/);
+  assert.match(result.text, /下一页从第 21 条开始/);
+  assert.equal(result.route, "ai-history");
+});
+
 test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {
   const agent = new OpenAIResponsesAgent({
     model: "test-model",

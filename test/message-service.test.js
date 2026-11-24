@@ -6,6 +6,7 @@ import { LangChainGroupMemory } from "../src/app/langchain-group-memory.js";
 import { GroupAiControl } from "../src/app/group-ai-control.js";
 import { MessageService } from "../src/app/message-service.js";
 import { createBuiltinCommandRegistry } from "../src/commands/builtins/index.js";
+import { SqliteChatArchive } from "../src/memory/sqlite-chat-archive.js";
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -33,17 +34,26 @@ function createService(
     botMemberOpenid = "bot-member-openid",
     botIdentityResolver,
     logger: serviceLogger = logger,
+    sendGroupText,
   } = {},
 ) {
   const sent = [];
   const memory = new LangChainGroupMemory();
+  const archive = new SqliteChatArchive({ database: memory.database });
   const aiControl = new GroupAiControl();
   const service = new MessageService({
-    qqApi: { async sendGroupText(message) { sent.push(message); } },
+    qqApi: {
+      async sendGroupText(message) {
+        const response = await sendGroupText?.(message);
+        sent.push(message);
+        return response;
+      },
+    },
     registry: createBuiltinCommandRegistry(),
     aiAgent,
     deduplicator: new EventDeduplicator(),
     memory,
+    chatArchive: archive,
     longTermMemory,
     aiControl,
     botIdentityResolver: botIdentityResolver || {
@@ -54,7 +64,7 @@ function createService(
     },
     logger: serviceLogger,
   });
-  return { service, sent, memory, aiControl };
+  return { service, sent, memory, aiControl, archive };
 }
 
 test("斜杠命令绕过 AI", async () => {
@@ -86,7 +96,7 @@ test("纯图片群消息进入 Responses API，群聊历史只保留图片数量
       },
     },
   });
-  const { service, sent, memory } = createService(agent);
+  const { service, sent, memory, archive } = createService(agent);
 
   assert.equal(await service.handleGatewayPayload(event), true);
 
@@ -98,6 +108,85 @@ test("纯图片群消息进入 Responses API，群聊历史只保留图片数量
   const [remembered] = await memory.get("group-1");
   assert.match(remembered.content, /"current_image_count": 1/);
   assert.doesNotMatch(remembered.content, /example\.invalid/);
+  assert.deepEqual(archive.search("group-1").messages[0].attachments, [
+    { type: "image/png", filename: null },
+  ]);
+});
+
+test("完整存档包含纯文件消息、原始正文、命令和实际发送的回复", async () => {
+  const { service, archive } = createService({
+    async respond() { assert.fail("纯文件消息和斜杠命令无需调用 AI"); },
+  });
+  const file = payload({ id: "archive-file", content: "" });
+  file.t = "GROUP_MESSAGE_CREATE";
+  file.d.mentions = [];
+  file.d.timestamp = "2026-11-23T08:00:00+08:00";
+  file.d.attachments = [{
+    content_type: "application/pdf",
+    filename: "团建方案.pdf",
+    url: "https://example.invalid/file",
+  }];
+  await service.handleGatewayPayload(file);
+  await service.handleGatewayPayload(payload({ id: "archive-command", content: " /ping " }));
+
+  const recorded = archive.search("group-1", { order: "oldest" }).messages;
+  assert.deepEqual(recorded.map(({ role, content }) => ({ role, content })), [
+    { role: "user", content: "" },
+    { role: "user", content: " /ping " },
+    { role: "assistant", content: "pong" },
+  ]);
+  assert.equal(recorded[0].time, "2026-11-23T08:00:00.000+08:00");
+  assert.deepEqual(recorded[0].attachments, [{ type: "application/pdf", filename: "团建方案.pdf" }]);
+  assert.equal(archive.search("group-1", { keyword: "团建" }).messages.length, 1);
+});
+
+test("回复发送失败仍保留来信，同群排队消息继续处理和存档", async () => {
+  const { service, sent, archive } = createService({
+    async respond() { return { text: "收到", route: "ai-text" }; },
+  }, {
+    async sendGroupText({ msgId }) {
+      if (msgId === "send-failed") throw new Error("模拟投递失败");
+      return { id: "outgoing-id" };
+    },
+  });
+  const outcomes = await Promise.allSettled([
+    service.handleGatewayPayload(payload({ id: "send-failed", content: "第一条" })),
+    service.handleGatewayPayload(payload({ id: "send-success", content: "第二条" })),
+  ]);
+  assert.deepEqual(outcomes.map((item) => item.status), ["rejected", "fulfilled"]);
+  assert.equal(sent.length, 1);
+  const rows = archive.search("group-1", { order: "oldest" }).messages;
+  assert.deepEqual(rows.map(({ role, content }) => ({ role, content })), [
+    { role: "user", content: "第一条" },
+    { role: "user", content: "第二条" },
+    { role: "assistant", content: "收到" },
+  ]);
+});
+
+test("历史查询通过正常消息入口向模型返回同群记录并排除本次提问", async () => {
+  const { service, archive, sent } = createService({
+    async respond({ message, searchHistory }) {
+      if (message.msgId !== "history-question") return { text: null, route: "ai-silent" };
+      const result = searchHistory({ keyword: "团建", groupOpenid: "other-group" });
+      assert.deepEqual(result.messages.map((item) => item.content), ["团建改到周五"]);
+      return { text: result.messages[0].content, route: "ai-history" };
+    },
+  });
+  const other = payload({ id: "other-private", content: "团建秘密" });
+  other.d.group_openid = "other-group";
+  archive.recordIncoming({
+    groupOpenid: other.d.group_openid,
+    msgId: other.d.id,
+    username: "小红",
+    memberOpenid: "other-member",
+    text: other.d.content,
+  });
+  const event = payload({ id: "history-record", content: "团建改到周五" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  await service.handleGatewayPayload(event);
+  await service.handleGatewayPayload(payload({ id: "history-question", content: "团建什么时候？" }));
+  assert.equal(sent[0].content, "团建改到周五");
 });
 
 test("AT 事件不依赖 mentions 或群状态接口即可执行手写命令", async () => {
@@ -229,7 +318,7 @@ test("重复事件只回复一次", async () => {
 });
 
 test("相同事件 ID 或消息回退 ID 在不同群之间独立去重", async () => {
-  const { service, sent } = createService({
+  const { service, sent, archive } = createService({
     async respond() { return { text: "ok", route: "ai-text" }; },
   });
   for (const useEventId of [true, false]) {
@@ -245,6 +334,8 @@ test("相同事件 ID 或消息回退 ID 在不同群之间独立去重", async 
   assert.deepEqual(sent.map((message) => message.groupOpenid), [
     "group-1", "group-2", "group-1", "group-2",
   ]);
+  assert.equal(archive.search("group-1", { keyword: "/ping" }).messages.length, 2);
+  assert.equal(archive.search("group-2", { keyword: "/ping" }).messages.length, 2);
 });
 
 test("引用内容不会改变斜杠命令的确定性路由", async () => {
@@ -489,7 +580,7 @@ test("AI 回避期间普通消息不调用任何 AI 能力、不回复且不写�
     async recall() { recallCalls += 1; return []; },
     async observe() { observeCalls += 1; return 0; },
   };
-  const { service, sent, memory } = createService({
+  const { service, sent, memory, archive } = createService({
     async respond() { responseCalls += 1; return { text: "不应出现", route: "ai-text" }; },
   }, { longTermMemory });
 
@@ -507,6 +598,8 @@ test("AI 回避期间普通消息不调用任何 AI 能力、不回复且不写�
   assert.equal(recallCalls, 0);
   assert.equal(observeCalls, 0);
   assert.deepEqual(await memory.get("group-1"), []);
+  assert.deepEqual(archive.search("group-1").messages.map((item) => item.role), ["assistant", "user"]);
+  assert.equal(archive.search("group-1", { keyword: "不能" }).messages.length, 0);
 });
 
 test("自然语言可以调用本地命令进入回避，但不能产生后续记忆调用", async () => {

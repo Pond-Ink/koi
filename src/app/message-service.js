@@ -37,6 +37,10 @@ function classifyMessage(message, { aiEnabled, commandPrefix }) {
     return { kind: "command", commandText };
   }
   if (!aiEnabled) return { kind: "ignored" };
+  if (!message.text && !message.imageUrls?.length && !message.replyTo?.imageUrls?.length
+    && !message.isExplicitBotMention) {
+    return { kind: "archive-only" };
+  }
   return {
     kind: "ai",
     engagement: message.isExplicitBotMention ? "direct" : "selective",
@@ -50,6 +54,7 @@ export class MessageService {
     aiAgent,
     deduplicator,
     memory,
+    chatArchive = null,
     longTermMemory = null,
     botIdentityResolver,
     aiControl,
@@ -61,6 +66,7 @@ export class MessageService {
     this.aiAgent = aiAgent;
     this.deduplicator = deduplicator;
     this.memory = memory;
+    this.chatArchive = chatArchive;
     this.longTermMemory = longTermMemory;
     this.botIdentityResolver = botIdentityResolver;
     this.aiControl = aiControl;
@@ -152,6 +158,14 @@ export class MessageService {
       });
       return true;
     }
+    const archived = aiWasEnabled && this.chatArchive
+      && this.saveArchiveRecord(message, () => this.chatArchive.recordIncoming(message));
+    if (route.kind === "archive-only") {
+      this.logMessageHandling(message, logContent, archived ? "已保存群聊记录" : "群聊记录未保存", {
+        route: archived ? "archive-only" : "archive-error",
+      });
+      return true;
+    }
     let result;
     try {
       result = await this.executeRoute(route, message, commandContext);
@@ -172,7 +186,7 @@ export class MessageService {
       return this.rememberWithoutReply(message, memoryContent, logContent, result.route);
     }
 
-    const replyChunks = await this.sendReply(message, result.text);
+    const replyChunks = await this.sendReply(message, result.text, aiWasEnabled);
     const aiIsEnabledAfter = this.aiControl.isEnabled(message.groupOpenid);
     if (aiWasEnabled && aiIsEnabledAfter) {
       await this.memory.addTurn(message.groupOpenid, {
@@ -206,6 +220,12 @@ export class MessageService {
       longTermMemories: await this.recallLongTermMemory(message),
       tools: this.registry.toAiTools(),
       executeTool: (name, args) => this.registry.executeTool(name, args, commandContext),
+      searchHistory: this.chatArchive
+        ? (args) => this.chatArchive.search(message.groupOpenid, args, {
+          excludeMessageId: message.msgId,
+          currentMemberOpenid: message.memberOpenid,
+        })
+        : undefined,
       engagement: route.engagement,
     });
   }
@@ -231,15 +251,32 @@ export class MessageService {
     });
   }
 
-  async sendReply(message, text) {
+  saveArchiveRecord(message, operation) {
+    try {
+      operation();
+      return true;
+    } catch (error) {
+      this.logger.error("保存完整聊天记录失败", { error, msgId: message.msgId });
+      return false;
+    }
+  }
+
+  async sendReply(message, text, archiveEnabled) {
     const chunks = splitText(text, this.maxReplyChars);
     for (let index = 0; index < chunks.length; index += 1) {
-      await this.qqApi.sendGroupText({
+      const response = await this.qqApi.sendGroupText({
         groupOpenid: message.groupOpenid,
         content: chunks[index],
         msgId: message.msgId,
         msgSeq: index + 1,
       });
+      if (archiveEnabled && this.chatArchive) {
+        this.saveArchiveRecord(message, () => this.chatArchive.recordReply(message, {
+          content: chunks[index],
+          msgSeq: index + 1,
+          response,
+        }));
+      }
     }
     return chunks.length;
   }

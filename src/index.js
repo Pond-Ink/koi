@@ -10,6 +10,7 @@ import { createLogger } from "./infra/logger.js";
 import { LongTermMemoryExtractor } from "./memory/long-term-memory-extractor.js";
 import { OpenAISdkEmbeddings } from "./memory/openai-embeddings.js";
 import { SqliteDatabase } from "./memory/sqlite-database.js";
+import { SqliteChatArchive } from "./memory/sqlite-chat-archive.js";
 import { SqliteLongTermMemoryStore } from "./memory/sqlite-long-term-memory-store.js";
 import { loadPersona } from "./persona/persona-loader.js";
 import { AccessTokenManager } from "./qq/access-token-manager.js";
@@ -66,6 +67,7 @@ const messageService = new MessageService({
     database,
     maxMessages: config.memory.historyMessages,
   }),
+  chatArchive: new SqliteChatArchive({ database, botName: persona.name }),
   longTermMemory,
   botIdentityResolver: new GroupBotIdentityResolver({ qqApi }),
   aiControl: new GroupAiControl({ database }),

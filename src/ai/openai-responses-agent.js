@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { formatLongTermMemoriesForAi, formatMessageInput } from "./message-context.js";
 import { buildAgentInstructions } from "../persona/prompt-builder.js";
+import { CHAT_HISTORY_TOOL, HISTORY_ANSWER_INSTRUCTIONS, formatHistoryRecords, historyToolInstructions } from "./chat-history-tool.js";
 
 const DEFAULT_PERSONA = Object.freeze({
   version: 1,
@@ -166,12 +167,47 @@ export class OpenAIResponsesAgent {
     return { text: WEB_SEARCH_FAILURE, route: "ai-search-error" };
   }
 
+  async answerFromHistory({ args, searchHistory, input, instructions }) {
+    let result;
+    try {
+      result = await searchHistory(args);
+    } catch {
+      return { text: "聊天记录查询失败，请重新指定关键词、成员或时间范围。", route: "ai-history-error" };
+    }
+    if (!result.messages.length) {
+      return { text: "本群已存档的聊天记录中没有找到符合条件的消息。", route: "ai-history" };
+    }
+    let text;
+    try {
+      const response = await this.request({
+        instructions: `${instructions}\n\n${HISTORY_ANSWER_INSTRUCTIONS}`,
+        input: [
+          ...input,
+          { role: "user", content: `本地聊天记录查询结果：\n${JSON.stringify(result)}` },
+        ],
+        tools: [],
+        tool_choice: "none",
+        ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
+      });
+      if (response.status !== "failed") text = extractOutputText(response);
+    } catch (error) {
+      if (!(error instanceof OpenAIResponsesError)) throw error;
+    }
+    const answer = text || formatHistoryRecords(result.messages);
+    return {
+      text: result.next_offset === null ? answer
+        : `${answer}\n\n还有更多匹配记录，下一页从第 ${result.next_offset + 1} 条开始，可以继续查询或缩小范围。`,
+      route: "ai-history",
+    };
+  }
+
   async respond({
     message,
     history,
     longTermMemories = [],
     tools = [],
     executeTool,
+    searchHistory,
     engagement = "direct",
   }) {
     const recalledMemory = formatLongTermMemoriesForAi(longTermMemories);
@@ -181,19 +217,30 @@ export class OpenAIResponsesAgent {
       { role: "user", content: formatMessageInput(message) },
     ];
     const searchEnabled = this.webSearch === "deepseek" && engagement === "direct";
+    const historyEnabled = typeof searchHistory === "function" && engagement === "direct";
+    const instructions = [
+      this.instructions,
+      `<engagement>\n${engagementInstructions(engagement)}\n</engagement>`,
+      ...(searchEnabled ? [WEB_SEARCH_ROUTING] : []),
+      ...(historyEnabled ? [historyToolInstructions(message.sentAt)] : []),
+    ].join("\n\n");
     const response = await this.request({
-      instructions: `${this.instructions}\n\n<engagement>\n${engagementInstructions(engagement)}\n</engagement>${
-        searchEnabled ? `\n\n${WEB_SEARCH_ROUTING}` : ""
-      }`,
+      instructions,
       input,
-      tools: searchEnabled ? [WEB_SEARCH_TOOL, ...tools] : tools,
+      tools: [
+        ...(historyEnabled ? [CHAT_HISTORY_TOOL] : []),
+        ...(searchEnabled ? [WEB_SEARCH_TOOL] : []),
+        ...tools,
+      ],
       tool_choice: "auto",
       parallel_tool_calls: false,
       ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
     });
 
     const toolCalls = (response.output || []).filter((item) => item.type === "function_call");
-    const toolCall = toolCalls.find((item) => item.name !== WEB_SEARCH_TOOL.name) || toolCalls[0];
+    const toolCall = toolCalls.find((item) => item.name.startsWith("command_"))
+      || toolCalls.find((item) => item.name === CHAT_HISTORY_TOOL.name)
+      || toolCalls[0];
     if (toolCall) {
       let args;
       try {
@@ -204,6 +251,10 @@ export class OpenAIResponsesAgent {
       if (toolCall.name === WEB_SEARCH_TOOL.name) {
         if (!searchEnabled) throw new OpenAIResponsesError("当前消息未启用联网搜索");
         return this.searchWeb(args);
+      }
+      if (toolCall.name === CHAT_HISTORY_TOOL.name) {
+        if (!historyEnabled) throw new OpenAIResponsesError("当前消息未启用历史记录查询");
+        return this.answerFromHistory({ args, searchHistory, input, instructions });
       }
       const result = await executeTool(toolCall.name, args);
       return { ...result, route: "ai-tool" };

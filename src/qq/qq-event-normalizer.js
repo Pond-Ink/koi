@@ -55,6 +55,15 @@ function getAttachments(message) {
   return Array.isArray(message.attachments) ? message.attachments.filter(Boolean) : [];
 }
 
+function messageTimestamp(value) {
+  const timestamp = typeof value === "number"
+    ? (value < 1e12 ? value * 1000 : value)
+    : Date.parse(value);
+  return Number.isFinite(timestamp) && Number.isFinite(new Date(timestamp + 28_800_000).getTime())
+    ? timestamp
+    : Date.now();
+}
+
 function getImageUrls(attachments) {
   const urls = new Set();
   for (const attachment of attachments) {
@@ -140,23 +149,28 @@ export function normalizeGroupMessageEvent(
   const currentElement = findElementByIndex(elements, msgIndex);
   const currentElements = currentElement ? flattenElements([currentElement], referenceElement) : elements;
   const text = message.content?.trim() || collectElementText(currentElements);
-  const imageUrls = getImageUrls([
+  const attachments = [
     ...getAttachments(message),
     ...elements.flatMap(getAttachments),
-  ]);
+  ];
+  const imageUrls = getImageUrls(attachments);
   const mentions = normalizeMentions(message.mentions, botMemberOpenid);
   const isExplicitBotMention = payload.t === "GROUP_AT_MESSAGE_CREATE"
     || mentions.some((mention) => mention.isCurrentBot);
-  if (!text && !imageUrls.length && !replyTo?.imageUrls.length && !isExplicitBotMention) return null;
-
   return Object.freeze({
     type: payload.t,
     msgId: String(message.id),
     msgIndex,
     groupOpenid,
     memberOpenid: String(message.author?.member_openid || message.author?.id || "unknown"),
-    username: message.author?.username || "群成员",
+    username: message.author?.username || message.author?.nickname || message.member?.nick || "群成员",
     text,
+    rawText: typeof message.content === "string" && (message.content.trim() || !text) ? message.content : text,
+    sentAt: messageTimestamp(message.timestamp),
+    attachments: attachments.map((attachment) => ({
+      type: attachment.content_type || attachment.type || "unknown",
+      filename: attachment.filename || null,
+    })),
     imageUrls,
     isExplicitBotMention,
     mentions,

@@ -1,0 +1,82 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { LangChainGroupMemory } from "../src/app/langchain-group-memory.js";
+import { SqliteDatabase } from "../src/memory/sqlite-database.js";
+import { SqliteChatArchive } from "../src/memory/sqlite-chat-archive.js";
+
+test("完整存档跨重启保留全部消息，并仅迁移一次现存的旧上下文", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "koi-archive-"));
+  const filename = join(directory, "archive.sqlite");
+  let database = new SqliteDatabase({ filename });
+  t.after(() => {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const memory = new LangChainGroupMemory({ database, maxMessages: 3 });
+  await memory.addUserMessage("group-a", "小明：旧消息");
+  let archive = new SqliteChatArchive({ database });
+  const start = Date.parse("2026-11-23T08:00:00+08:00");
+  for (let index = 0; index < 40; index += 1) {
+    const message = {
+      groupOpenid: "group-a",
+      msgId: `message-${index}`,
+      username: "小明",
+      memberOpenid: "member-1",
+      text: `团建讨论第 ${index} 条`,
+      sentAt: start + index * 1000,
+    };
+    archive.recordIncoming(message);
+    archive.recordIncoming(message);
+    await memory.addUserMessage("group-a", message.text);
+  }
+  assert.equal((await memory.get("group-a")).length, 3);
+  database.close();
+  database = new SqliteDatabase({ filename });
+  archive = new SqliteChatArchive({ database });
+
+  const firstPage = archive.search("group-a", { keyword: "团建", order: "oldest", limit: 30 });
+  assert.equal(firstPage.messages.length, 30);
+  assert.equal(firstPage.messages[0].content, "团建讨论第 0 条");
+  assert.equal(firstPage.next_offset, 30);
+  const lastPage = archive.search("group-a", { keyword: "团建", order: "oldest", offset: 30 });
+  assert.equal(lastPage.messages.length, 10);
+  assert.equal(lastPage.next_offset, null);
+  const legacy = archive.search("group-a", { keyword: "旧消息", member: "小明" });
+  assert.equal(legacy.messages.length, 1);
+  assert.equal(legacy.messages[0].legacy, true);
+});
+
+test("完整存档支持时间范围、成员、本人及关键词联合查询，群之间隔离", () => {
+  const database = new SqliteDatabase();
+  const archive = new SqliteChatArchive({ database });
+  const message = {
+    groupOpenid: "group-a",
+    msgId: "one",
+    username: "小明",
+    memberOpenid: "member-1",
+    text: "团建：杭州",
+    sentAt: Date.parse("2026-11-23T10:00:00+08:00"),
+  };
+  archive.recordIncoming(message);
+  archive.recordIncoming({
+    ...message, msgId: "two", username: "小明", memberOpenid: "member-2", text: "团建：上海",
+  });
+  archive.recordIncoming({
+    ...message, msgId: "three", sentAt: Date.parse("2026-11-24T00:00:00+08:00"),
+  });
+  archive.recordIncoming({ ...message, groupOpenid: "group-b", text: "团建：其他群" });
+  const options = {
+    keyword: "团建", member: "$self", start_time: "2026-11-23", end_time: "2026-11-24",
+  };
+  const result = archive.search("group-a", options, { currentMemberOpenid: "member-1" });
+  assert.deepEqual(result.messages.map((row) => row.content), ["团建：杭州"]);
+  assert.equal(result.messages[0].time, "2026-11-23T10:00:00.000+08:00");
+  assert.equal(archive.search("group-b", { keyword: "杭州" }).messages.length, 0);
+  assert.throws(() => archive.search("group-a", { start_time: "invalid" }), /ISO/);
+  assert.throws(() => archive.search("group-a", { start_time: "2026-02-31" }), /ISO/);
+  assert.throws(() => archive.search("group-a", { limit: 500 }), /分页/);
+  database.close();
+});
