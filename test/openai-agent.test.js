@@ -322,6 +322,51 @@ test("历史查询结果为空时直接提示，旁听时拒绝历史工具调�
   assert.equal(searches, 1);
 });
 
+test("历史搜索找到合并转发时，必须再调用展开工具才能读取实际内容", async () => {
+  const requests = [];
+  const forwardId = "synthetic-forward-id";
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    webSearch: "deepseek",
+    client: { responses: {
+      async create(body) {
+        requests.push(body);
+        if (requests.length === 1) return { output: [{
+          type: "function_call", name: "search_chat_history", arguments: '{"keyword":"团建"}',
+        }] };
+        if (requests.length === 2) return { output: [{
+          type: "function_call", name: "read_forwarded_message",
+          arguments: JSON.stringify({ forward_id: forwardId, offset: 0, limit: 20 }),
+        }] };
+        return { output_text: "集合安排在周五。" };
+      },
+    } },
+  });
+  const result = await agent.respond({
+    message: { username: "小明", text: "查之前的团建合并转发" },
+    history: [],
+    searchHistory() {
+      return { messages: [{
+        sender: "小红", content: "合并转发", forwarded_messages: [{ forward_id: forwardId, entry_count: 1 }],
+      }], next_offset: null };
+    },
+    readForwarded(args) {
+      assert.equal(args.forward_id, forwardId);
+      return {
+        forward_id: forwardId, total_entries: 1,
+        entries: [{ sender: "测试成员", text: "原文：集合安排在周五。", attachments: [], image_count: 0 }],
+        next_offset: null,
+      };
+    },
+  });
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[1].tools.map((tool) => tool.name), ["read_forwarded_message"]);
+  assert.doesNotMatch(JSON.stringify(requests[1].input), /原文：集合安排在周五/);
+  assert.match(JSON.stringify(requests[2].input), /原文：集合安排在周五/);
+  assert.deepEqual(requests[2].tools, []);
+  assert.equal(result.route, "ai-forward");
+});
+
 test("历史查询结果分页且模型整理失败时，仍返回实际记录和下一页位置", async () => {
   let calls = 0;
   const agent = new OpenAIResponsesAgent({

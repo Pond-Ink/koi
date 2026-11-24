@@ -80,3 +80,47 @@ test("完整存档支持时间范围、成员、本人及关键词联合查询�
   assert.throws(() => archive.search("group-a", { limit: 500 }), /分页/);
   database.close();
 });
+
+test("合并转发原文单独持久化，历史搜索只返回引用，图片链接仅临时缓存", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "koi-forward-"));
+  const filename = join(directory, "archive.sqlite");
+  let database = new SqliteDatabase({ filename });
+  t.after(() => {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  let now = 1000;
+  let archive = new SqliteChatArchive({ database, clock: () => now });
+  const card = {
+    id: "forward-card-one",
+    source: "current",
+    entries: [
+      { sender: "小红", time: "2026-11-20T12:00:00+08:00", text: "转发秘密文字", attachments: [], imageUrls: [] },
+      { sender: "小明", time: null, text: "查看图片", attachments: [{ type: "image/png", filename: "图.png" }],
+        imageUrls: ["https://example.invalid/temporary"] },
+    ],
+  };
+  archive.recordIncoming({
+    groupOpenid: "group-a", msgId: "message-one", msgIndex: "original-index",
+    username: "转发者", memberOpenid: "member-a", text: "", forwardedMessages: [card],
+  });
+  assert.equal(archive.search("group-a", { keyword: "秘密文字" }).messages.length, 1);
+  assert.doesNotMatch(JSON.stringify(archive.search("group-a", { keyword: "秘密文字" })), /秘密文字|temporary/);
+  assert.equal(archive.readForwarded("group-b", { forward_id: card.id }), null);
+  const first = archive.readForwarded("group-a", { forward_id: "original-index", limit: 1 });
+  assert.equal(first.entries[0].text, "转发秘密文字");
+  assert.equal(first.next_offset, 1);
+  const second = archive.readForwarded("group-a", { forward_id: card.id, offset: 1 });
+  assert.deepEqual(second.entries[0].imageUrls, ["https://example.invalid/temporary"]);
+  const stored = database.connection.prepare("SELECT entries_json FROM chat_forward_records").get();
+  assert.doesNotMatch(stored.entries_json, /temporary|imageUrls/);
+  now += 600_001;
+  assert.deepEqual(archive.readForwarded("group-a", { forward_id: card.id, offset: 1 }).entries[0].imageUrls, []);
+  database.close();
+  database = new SqliteDatabase({ filename });
+  archive = new SqliteChatArchive({ database });
+  const reopened = archive.readForwarded("group-a", { forward_id: card.id });
+  assert.equal(reopened.entries[0].text, "转发秘密文字");
+  assert.equal(reopened.entries[1].image_count, 1);
+  assert.deepEqual(reopened.entries[1].imageUrls, []);
+});

@@ -38,7 +38,7 @@ function classifyMessage(message, { aiEnabled, commandPrefix }) {
   }
   if (!aiEnabled) return { kind: "ignored" };
   if (!message.text && !message.imageUrls?.length && !message.replyTo?.imageUrls?.length
-    && !message.isExplicitBotMention) {
+    && !message.forwardedMessages?.length && !message.isExplicitBotMention) {
     return { kind: "archive-only" };
   }
   return {
@@ -225,6 +225,9 @@ export class MessageService {
           excludeMessageId: message.msgId,
           currentMemberOpenid: message.memberOpenid,
         })
+        : undefined,
+      readForwarded: this.chatArchive
+        ? (args) => this.chatArchive.readForwarded(message.groupOpenid, args, message.forwardedMessages)
         : undefined,
       engagement: route.engagement,
     });

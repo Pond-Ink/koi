@@ -8,6 +8,7 @@ function summarizeAttachments(attachments = []) {
 function currentMessageText(message) {
   if (message.text) return message.text;
   if (message.imageUrls?.length || message.replyTo?.imageUrls?.length) return "";
+  if (message.forwardedMessages?.length) return "";
   if (message.isExplicitBotMention) {
     return "[用户仅 @ 机器人，未附带文字；请结合最近群聊上下文自然回应。]";
   }
@@ -43,14 +44,21 @@ function replaceMentionMarkup(text, message) {
 }
 
 export function formatMessageForLog(message) {
-  return replaceMentionMarkup(message.text || "", message);
+  const text = replaceMentionMarkup(message.text || "", message);
+  const cards = (message.forwardedMessages || []).map((card) => `[合并转发 ${card.id}]`);
+  return [text, ...cards].filter(Boolean).join("\n");
 }
 
 export function formatMessageForAi(message) {
   const currentMessage = replaceMentionMarkup(currentMessageText(message), message);
   const hasMentionContext = message.isExplicitBotMention || message.mentions?.length;
   const imageCount = message.imageUrls?.length;
-  if (!message.replyTo && !hasMentionContext && !imageCount) {
+  const forwards = (message.forwardedMessages || []).map((card) => ({
+    forward_id: card.id,
+    source: card.source,
+    entry_count: card.entries.length,
+  }));
+  if (!message.replyTo && !hasMentionContext && !imageCount && !forwards.length) {
     return `${message.username}：${currentMessage}`;
   }
 
@@ -58,6 +66,7 @@ export function formatMessageForAi(message) {
     sender: message.username,
     current_message: currentMessage,
     ...(imageCount ? { current_image_count: imageCount } : {}),
+    ...(forwards.length ? { forwarded_messages: forwards } : {}),
     explicitly_mentions_current_bot: Boolean(message.isExplicitBotMention),
     mentioned_users: formatMentions(message),
     ...(message.replyTo ? {
@@ -69,7 +78,8 @@ export function formatMessageForAi(message) {
         attachments: summarizeAttachments(message.replyTo.attachments),
         ...(message.replyTo.imageUrls?.length ? { image_count: message.replyTo.imageUrls.length } : {}),
         content_available: Boolean(
-          message.replyTo.text || message.replyTo.attachments?.length || message.replyTo.imageUrls?.length,
+          message.replyTo.text || message.replyTo.attachments?.length || message.replyTo.imageUrls?.length
+          || forwards.some((card) => card.source === "reply"),
         ),
       },
     } : {}),

@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { formatLongTermMemoriesForAi, formatMessageInput } from "./message-context.js";
 import { buildAgentInstructions } from "../persona/prompt-builder.js";
 import { CHAT_HISTORY_TOOL, HISTORY_ANSWER_INSTRUCTIONS, formatHistoryRecords, historyToolInstructions } from "./chat-history-tool.js";
+import { FORWARDED_MESSAGE_TOOL, FORWARDED_MESSAGE_ROUTING, FORWARDED_ANSWER_INSTRUCTIONS, formatForwardedInput, formatForwardedRecords } from "./forwarded-message-tool.js";
 
 const DEFAULT_PERSONA = Object.freeze({
   version: 1,
@@ -62,6 +63,14 @@ function extractOutputText(response) {
     .map((item) => item.text)
     .join("\n")
     .trim();
+}
+
+function parseToolArguments(toolCall) {
+  try {
+    return JSON.parse(toolCall.arguments);
+  } catch {
+    throw new OpenAIResponsesError("模型返回了无效的工具参数 JSON");
+  }
 }
 
 function uniqueSourceUrls(values) {
@@ -167,7 +176,7 @@ export class OpenAIResponsesAgent {
     return { text: WEB_SEARCH_FAILURE, route: "ai-search-error" };
   }
 
-  async answerFromHistory({ args, searchHistory, input, instructions }) {
+  async answerFromHistory({ args, searchHistory, readForwarded, input, instructions }) {
     let result;
     try {
       result = await searchHistory(args);
@@ -178,17 +187,28 @@ export class OpenAIResponsesAgent {
       return { text: "本群已存档的聊天记录中没有找到符合条件的消息。", route: "ai-history" };
     }
     let text;
+    const canExpand = typeof readForwarded === "function"
+      && result.messages.some((message) => message.forwarded_messages?.length);
+    const followInput = [
+      ...input,
+      { role: "user", content: `本地聊天记录查询结果：\n${JSON.stringify(result)}` },
+    ];
     try {
       const response = await this.request({
         instructions: `${instructions}\n\n${HISTORY_ANSWER_INSTRUCTIONS}`,
-        input: [
-          ...input,
-          { role: "user", content: `本地聊天记录查询结果：\n${JSON.stringify(result)}` },
-        ],
-        tools: [],
-        tool_choice: "none",
+        input: followInput,
+        tools: canExpand ? [FORWARDED_MESSAGE_TOOL] : [],
+        tool_choice: canExpand ? "auto" : "none",
         ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
       });
+      const expandCall = canExpand && response.output?.find((item) => (
+        item.type === "function_call" && item.name === FORWARDED_MESSAGE_TOOL.name
+      ));
+      if (expandCall) {
+        return this.answerFromForwarded({
+          args: parseToolArguments(expandCall), readForwarded, input: followInput, instructions,
+        });
+      }
       if (response.status !== "failed") text = extractOutputText(response);
     } catch (error) {
       if (!(error instanceof OpenAIResponsesError)) throw error;
@@ -201,6 +221,37 @@ export class OpenAIResponsesAgent {
     };
   }
 
+  async answerFromForwarded({ args, readForwarded, input, instructions }) {
+    let result;
+    try {
+      result = await readForwarded(args);
+    } catch {
+      return { text: "合并转发展开失败，请确认记录标识和分页位置。", route: "ai-forward-error" };
+    }
+    if (!result || !result.entries.length) {
+      return { text: "本群未找到该合并转发的可读取内容。", route: "ai-forward" };
+    }
+    let text;
+    try {
+      const response = await this.request({
+        instructions: `${instructions}\n\n${FORWARDED_ANSWER_INSTRUCTIONS}`,
+        input: [...input, { role: "user", content: formatForwardedInput(result) }],
+        tools: [],
+        tool_choice: "none",
+        ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
+      });
+      if (response.status !== "failed") text = extractOutputText(response);
+    } catch (error) {
+      if (!(error instanceof OpenAIResponsesError)) throw error;
+    }
+    const answer = text || formatForwardedRecords(result.entries) || "本条转发没有可显示的文本。";
+    return {
+      text: result.next_offset === null ? answer
+        : `${answer}\n\n转发记录 ${result.forward_id} 尚有更多内容，下一页从第 ${result.next_offset + 1} 条开始。`,
+      route: "ai-forward",
+    };
+  }
+
   async respond({
     message,
     history,
@@ -208,6 +259,7 @@ export class OpenAIResponsesAgent {
     tools = [],
     executeTool,
     searchHistory,
+    readForwarded,
     engagement = "direct",
   }) {
     const recalledMemory = formatLongTermMemoriesForAi(longTermMemories);
@@ -218,16 +270,19 @@ export class OpenAIResponsesAgent {
     ];
     const searchEnabled = this.webSearch === "deepseek" && engagement === "direct";
     const historyEnabled = typeof searchHistory === "function" && engagement === "direct";
+    const forwardEnabled = typeof readForwarded === "function" && engagement === "direct";
     const instructions = [
       this.instructions,
       `<engagement>\n${engagementInstructions(engagement)}\n</engagement>`,
       ...(searchEnabled ? [WEB_SEARCH_ROUTING] : []),
       ...(historyEnabled ? [historyToolInstructions(message.sentAt)] : []),
+      ...(forwardEnabled ? [FORWARDED_MESSAGE_ROUTING] : []),
     ].join("\n\n");
     const response = await this.request({
       instructions,
       input,
       tools: [
+        ...(forwardEnabled ? [FORWARDED_MESSAGE_TOOL] : []),
         ...(historyEnabled ? [CHAT_HISTORY_TOOL] : []),
         ...(searchEnabled ? [WEB_SEARCH_TOOL] : []),
         ...tools,
@@ -239,22 +294,22 @@ export class OpenAIResponsesAgent {
 
     const toolCalls = (response.output || []).filter((item) => item.type === "function_call");
     const toolCall = toolCalls.find((item) => item.name.startsWith("command_"))
+      || toolCalls.find((item) => item.name === FORWARDED_MESSAGE_TOOL.name)
       || toolCalls.find((item) => item.name === CHAT_HISTORY_TOOL.name)
       || toolCalls[0];
     if (toolCall) {
-      let args;
-      try {
-        args = JSON.parse(toolCall.arguments);
-      } catch {
-        throw new OpenAIResponsesError("模型返回了无效的工具参数 JSON");
-      }
+      const args = parseToolArguments(toolCall);
       if (toolCall.name === WEB_SEARCH_TOOL.name) {
         if (!searchEnabled) throw new OpenAIResponsesError("当前消息未启用联网搜索");
         return this.searchWeb(args);
       }
       if (toolCall.name === CHAT_HISTORY_TOOL.name) {
         if (!historyEnabled) throw new OpenAIResponsesError("当前消息未启用历史记录查询");
-        return this.answerFromHistory({ args, searchHistory, input, instructions });
+        return this.answerFromHistory({ args, searchHistory, readForwarded: forwardEnabled ? readForwarded : undefined, input, instructions });
+      }
+      if (toolCall.name === FORWARDED_MESSAGE_TOOL.name) {
+        if (!forwardEnabled) throw new OpenAIResponsesError("当前消息未启用合并转发查询");
+        return this.answerFromForwarded({ args, readForwarded, input, instructions });
       }
       const result = await executeTool(toolCall.name, args);
       return { ...result, route: "ai-tool" };

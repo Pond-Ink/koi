@@ -1,5 +1,9 @@
+import { createHash } from "node:crypto";
+
 const SUPPORTED_EVENTS = new Set(["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"]);
 const IMAGE_EXTENSION = /\.(jpe?g|png|gif|webp)$/i;
+const FORWARD_TRANSCRIPT = /^\s*===\s*消息\s+\d+\s*===/;
+const FORWARD_PLACEHOLDER = /^\[(?:聊天记录|合并转发)\]$/;
 
 export function isSupportedGroupMessageEvent(payload) {
   return payload?.op === 0
@@ -34,10 +38,10 @@ function findReferenceIndex(message) {
     : String(direct);
 }
 
-function flattenElements(elements, excluded) {
+function flattenElements(elements, excluded = new Set()) {
   if (!Array.isArray(elements)) return [];
   return elements.flatMap((element) => (
-    element && element !== excluded
+    element && !excluded.has(element)
       ? [element, ...flattenElements(element.msg_elements, excluded)]
       : []
   ));
@@ -69,7 +73,8 @@ function getImageUrls(attachments) {
   for (const attachment of attachments) {
     if (typeof attachment.url !== "string") continue;
     const raw = attachment.url.trim();
-    const imageUrl = raw.startsWith("//") ? `https:${raw}` : raw;
+    const imageUrl = raw.startsWith("//") ? `https:${raw}`
+      : (/^[a-z0-9.-]+\.(?:qq\.com(?:\.cn)?|qpic\.cn)\//i.test(raw) ? `https://${raw}` : raw);
     const url = URL.parse(imageUrl);
     if (!url || !/^https?:\/\//i.test(imageUrl) || url.username || url.password) continue;
 
@@ -82,6 +87,78 @@ function getImageUrls(attachments) {
     }
   }
   return [...urls];
+}
+
+function isForwardElement(element) {
+  return Number(element?.message_type) === 102
+    || (typeof element?.content === "string" && FORWARD_TRANSCRIPT.test(element.content));
+}
+
+function collectForwardRoots(elements, excluded, roots = []) {
+  for (const element of Array.isArray(elements) ? elements : []) {
+    if (!element || excluded.has(element)) continue;
+    if (isForwardElement(element)) {
+      roots.push(element);
+      excluded.add(element);
+    } else {
+      collectForwardRoots(element.msg_elements, excluded, roots);
+    }
+  }
+  return roots;
+}
+
+function summarizeAttachments(attachments) {
+  return attachments.map((attachment) => ({
+    type: attachment.content_type || attachment.type || "unknown",
+    filename: attachment.filename || null,
+  }));
+}
+
+function forwardedTextParts(value) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  return value.split(/(?=^===\s*消息\s+\d+\s*===)/m)
+    .filter((part) => part.trim())
+    .flatMap((part) => {
+      const chars = Array.from(part);
+      const pieces = [];
+      for (let index = 0; index < chars.length; index += 4000) {
+        pieces.push(chars.slice(index, index + 4000).join(""));
+      }
+      return pieces;
+    });
+}
+
+function forwardEntries(node, path = []) {
+  const attachments = getAttachments(node);
+  const imageUrls = getImageUrls(attachments);
+  const isContainer = isForwardElement(node);
+  const placeholder = isContainer && typeof node.content === "string" && FORWARD_PLACEHOLDER.test(node.content.trim());
+  const text = forwardedTextParts(placeholder ? "" : node.content);
+  const parts = text.length ? text : (attachments.length ? [""] : []);
+  const author = node.author || node.member || node.sender || {};
+  const timestamp = node.timestamp ?? node.time;
+  const entries = parts.map((content, index) => ({
+    path: [...path, index + 1],
+    sender: isContainer ? null : ((typeof author === "string" ? author : (
+      author.username || author.member_nickname || author.nickname || author.nick
+    )) || node.username || node.nickname || null),
+    time: !isContainer && (typeof timestamp === "string" || typeof timestamp === "number") ? timestamp : null,
+    text: content,
+    attachments: index === 0 ? summarizeAttachments(attachments) : [],
+    imageUrls: index === 0 ? imageUrls : [],
+  }));
+  const children = Array.isArray(node.msg_elements) ? node.msg_elements : [];
+  return [
+    ...entries,
+    ...children.flatMap((child, index) => child ? forwardEntries(child, [...path, index + 1]) : []),
+  ];
+}
+
+function forwardRecord(groupOpenid, msgId, root, source, index) {
+  const id = "forward-" + createHash("sha256")
+    .update(JSON.stringify([groupOpenid, msgId, source, index]))
+    .digest("hex").slice(0, 24);
+  return { id, source, entries: forwardEntries(root) };
 }
 
 function findReferenceElement(message, referenceIndex, currentIndex) {
@@ -99,10 +176,10 @@ function findReferenceElement(message, referenceIndex, currentIndex) {
   return first;
 }
 
-function normalizeReplyTo(referenceIndex, referenceElement) {
+function normalizeReplyTo(referenceIndex, referenceElement, excluded) {
   if (!referenceIndex) return null;
 
-  const elements = flattenElements([referenceElement]);
+  const elements = flattenElements([referenceElement], excluded);
   const text = collectElementText(elements);
   const attachments = elements.flatMap(getAttachments);
   const author = referenceElement?.author || referenceElement?.member || {};
@@ -142,14 +219,27 @@ export function normalizeGroupMessageEvent(
   const groupOpenid = String(message.group_openid);
 
   const msgIndex = findMessageIndex(message);
-  const referenceIndex = findReferenceIndex(message);
+  const messageType = Number(message.message_type);
+  const isForward = messageType === 102
+    || ([101, 103].includes(messageType) && isForwardElement(message));
+  const referenceIndex = isForward ? "" : findReferenceIndex(message);
   const referenceElement = findReferenceElement(message, referenceIndex, msgIndex);
-  const replyTo = normalizeReplyTo(referenceIndex, referenceElement);
-  const elements = flattenElements(message.msg_elements, referenceElement);
+  const replyExcluded = new Set();
+  const replyRoots = collectForwardRoots([referenceElement], replyExcluded);
+  const replyTo = normalizeReplyTo(referenceIndex, referenceElement, replyExcluded);
+  const currentExcluded = new Set(referenceElement ? [referenceElement] : []);
+  const currentRoots = isForward ? [message] : collectForwardRoots(message.msg_elements, currentExcluded);
+  const forwardedMessages = [
+    ...currentRoots.map((root, index) => forwardRecord(groupOpenid, message.id, root, "current", index)),
+    ...replyRoots.map((root, index) => forwardRecord(groupOpenid, message.id, root, "reply", index)),
+  ];
+  const elements = isForward ? [] : flattenElements(message.msg_elements, currentExcluded);
   const currentElement = findElementByIndex(elements, msgIndex);
-  const currentElements = currentElement ? flattenElements([currentElement], referenceElement) : elements;
-  const text = message.content?.trim() || collectElementText(currentElements);
-  const attachments = [
+  const currentElements = currentElement ? flattenElements([currentElement], currentExcluded) : elements;
+  const suppliedText = message.content?.trim() || "";
+  const forwardPlaceholder = currentRoots.length && FORWARD_PLACEHOLDER.test(suppliedText);
+  const text = isForward ? "" : ((forwardPlaceholder ? "" : suppliedText) || collectElementText(currentElements));
+  const attachments = isForward ? [] : [
     ...getAttachments(message),
     ...elements.flatMap(getAttachments),
   ];
@@ -165,13 +255,12 @@ export function normalizeGroupMessageEvent(
     memberOpenid: String(message.author?.member_openid || message.author?.id || "unknown"),
     username: message.author?.username || message.author?.nickname || message.member?.nick || "群成员",
     text,
-    rawText: typeof message.content === "string" && (message.content.trim() || !text) ? message.content : text,
+    rawText: isForward || forwardPlaceholder ? text
+      : (typeof message.content === "string" && (message.content.trim() || !text) ? message.content : text),
     sentAt: messageTimestamp(message.timestamp),
-    attachments: attachments.map((attachment) => ({
-      type: attachment.content_type || attachment.type || "unknown",
-      filename: attachment.filename || null,
-    })),
+    attachments: summarizeAttachments(attachments),
     imageUrls,
+    forwardedMessages,
     isExplicitBotMention,
     mentions,
     replyTo,

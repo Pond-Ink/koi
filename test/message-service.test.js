@@ -7,6 +7,7 @@ import { GroupAiControl } from "../src/app/group-ai-control.js";
 import { MessageService } from "../src/app/message-service.js";
 import { createBuiltinCommandRegistry } from "../src/commands/builtins/index.js";
 import { SqliteChatArchive } from "../src/memory/sqlite-chat-archive.js";
+import { normalizeGroupMessageEvent } from "../src/qq/qq-event-normalizer.js";
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -138,6 +139,62 @@ test("完整存档包含纯文件消息、原始正文、命令和实际发送�
   assert.equal(recorded[0].time, "2026-11-23T08:00:00.000+08:00");
   assert.deepEqual(recorded[0].attachments, [{ type: "application/pdf", filename: "团建方案.pdf" }]);
   assert.equal(archive.search("group-1", { keyword: "团建" }).messages.length, 1);
+});
+
+test("普通群聊只注入合并转发引用，后续 @ 查询调用工具才提交正文和图片", async () => {
+  const event = payload({ id: "lazy-forward", content: "[聊天记录]" });
+  event.t = "GROUP_MESSAGE_CREATE";
+  event.d.mentions = [];
+  event.d.message_type = 102;
+  event.d.msg_elements = [
+    { content: "第一条转发原文" },
+    { content: "第二条转发原文", attachments: [
+      { content_type: "image/png", url: "https://example.invalid/lazy-image.png?token=temporary" },
+    ] },
+  ];
+  const forwardId = normalizeGroupMessageEvent(event).forwardedMessages[0].id;
+  const requests = [];
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    webSearch: "deepseek",
+    client: { responses: {
+      async create(body) {
+        requests.push(body);
+        if (requests.length === 1) return { output_text: SELECTIVE_SILENCE };
+        if (requests.length === 2) return { output: [{
+          type: "function_call",
+          name: "read_forwarded_message",
+          arguments: JSON.stringify({ forward_id: forwardId, offset: 0, limit: 20 }),
+        }] };
+        return { output_text: "转发总结" };
+      },
+    } },
+  });
+  const { service, archive, memory, sent } = createService(agent);
+  await service.handleGatewayPayload(event);
+  assert.equal(sent.length, 0);
+  assert.ok(JSON.stringify(await memory.get("group-1")).includes(forwardId));
+  assert.doesNotMatch(JSON.stringify(await memory.get("group-1")), /转发原文|lazy-image/);
+  await service.handleGatewayPayload(payload({ id: "expand-forward", content: "总结刚才的合并转发" }));
+  assert.equal(requests.length, 3);
+  assert.ok(!requests[0].tools.some((tool) => tool.name === "read_forwarded_message"));
+  assert.ok(requests[1].tools.some((tool) => tool.name === "read_forwarded_message"));
+  for (const request of requests.slice(0, 2)) {
+    assert.ok(JSON.stringify(request.input).includes(forwardId));
+    assert.doesNotMatch(JSON.stringify(request.input), /第一条转发原文|第二条转发原文|lazy-image/);
+  }
+  const expanded = requests[2].input.at(-1).content;
+  assert.match(expanded[0].text, /第一条转发原文/);
+  assert.match(expanded[0].text, /第二条转发原文/);
+  assert.deepEqual(expanded[1], {
+    type: "input_image", image_url: "https://example.invalid/lazy-image.png?token=temporary", detail: "auto",
+  });
+  assert.deepEqual(requests[2].tools, []);
+  assert.equal(sent[0].content, "转发总结");
+  const found = archive.search("group-1", { keyword: "第一条转发原文" }).messages[0];
+  assert.equal(found.forwarded_messages[0].forward_id, forwardId);
+  assert.doesNotMatch(JSON.stringify(found), /第一条转发原文|lazy-image/);
+  assert.equal(archive.readForwarded("other-group", { forward_id: forwardId }), null);
 });
 
 test("回复发送失败仍保留来信，同群排队消息继续处理和存档", async () => {
