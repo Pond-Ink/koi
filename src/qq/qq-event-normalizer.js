@@ -108,6 +108,7 @@ export function normalizeGroupMessageEvent(
 ) {
   if (!isSupportedGroupMessageEvent(payload)) return null;
   const message = payload.d;
+  const groupOpenid = String(message.group_openid);
 
   const replyTo = normalizeReplyTo(message);
   const text = (
@@ -125,13 +126,13 @@ export function normalizeGroupMessageEvent(
     type: payload.t,
     msgId: String(message.id),
     msgIndex,
-    groupOpenid: String(message.group_openid),
+    groupOpenid,
     memberOpenid: String(message.author?.member_openid || message.author?.id || "unknown"),
     username: message.author?.username || "群成员",
     text,
     isExplicitBotMention,
     mentions,
     replyTo,
-    dedupKey: String(payload.id || `${message.id}:${msgIndex}`),
+    dedupKey: JSON.stringify([groupOpenid, String(payload.id || `${message.id}:${msgIndex}`)]),
   });
 }

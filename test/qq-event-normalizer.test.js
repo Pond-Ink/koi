@@ -34,7 +34,7 @@ test("标准化群聊引用消息，且引用正文不混入当前正文", () =>
   const message = normalizeGroupMessageEvent(quotePayload());
 
   assert.equal(message.text, "这句话是什么意思？");
-  assert.equal(message.dedupKey, "event-quote");
+  assert.equal(message.dedupKey, JSON.stringify(["group-1", "event-quote"]));
   assert.deepEqual(message.replyTo, {
     messageId: "quoted-idx",
     username: "小红",

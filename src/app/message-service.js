@@ -126,7 +126,7 @@ export class MessageService {
 
   enqueue(message) {
     const previous = this.groupQueues.get(message.groupOpenid) || Promise.resolve();
-    const current = previous.then(() => this.processMessage(message));
+    const current = previous.catch(() => {}).then(() => this.processMessage(message));
     const tracked = current.finally(() => {
       if (this.groupQueues.get(message.groupOpenid) === tracked) {
         this.groupQueues.delete(message.groupOpenid);
@@ -147,7 +147,7 @@ export class MessageService {
     const logContent = formatMessageForLog(message);
 
     if (route.kind === "ignored") {
-      this.logMessageHandling(message, logContent, "AI 回避期间忽略", {
+      this.logMessageHandling(message, "", "AI 回避期间忽略", {
         route: "ai-avoid",
       });
       return true;

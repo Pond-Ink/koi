@@ -193,6 +193,25 @@ test("重复事件只回复一次", async () => {
   assert.equal(sent.length, 1);
 });
 
+test("相同事件 ID 或消息回退 ID 在不同群之间独立去重", async () => {
+  const { service, sent } = createService({
+    async respond() { return { text: "ok", route: "ai-text" }; },
+  });
+  for (const useEventId of [true, false]) {
+    const first = payload({ id: `shared-${useEventId}`, content: "/ping" });
+    if (!useEventId) delete first.id;
+    const second = { ...first, d: { ...first.d, group_openid: "group-2" } };
+
+    assert.equal(await service.handleGatewayPayload(first), true);
+    assert.equal(await service.handleGatewayPayload(second), true);
+    assert.equal(await service.handleGatewayPayload(first), false);
+    assert.equal(await service.handleGatewayPayload(second), false);
+  }
+  assert.deepEqual(sent.map((message) => message.groupOpenid), [
+    "group-1", "group-2", "group-1", "group-2",
+  ]);
+});
+
 test("引用内容不会改变斜杠命令的确定性路由", async () => {
   let aiCalls = 0;
   const event = payload({ id: "msg-4", content: "/ping" });
