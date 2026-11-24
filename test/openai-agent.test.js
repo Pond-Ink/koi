@@ -395,6 +395,101 @@ test("历史查询结果分页且模型整理失败时，仍返回实际记录�
   assert.equal(result.route, "ai-history");
 });
 
+test("模型在同一轮内可继续展开本卡片下一页，并携带已经展开的图片和文字", async () => {
+  const requests = [];
+  const offsets = [];
+  const forwardId = "forward-page-test";
+  const call = (offset) => ({ output: [{ type: "function_call", name: "read_forwarded_message",
+    arguments: JSON.stringify({ forward_id: forwardId, offset, limit: 30 }) }] });
+  const agent = new OpenAIResponsesAgent({
+    model: "test-model",
+    client: { responses: { async create(body) {
+      requests.push(body);
+      if (requests.length === 1) return call(0);
+      if (requests.length === 2) return call(30);
+      return { output_text: "完整总结两页" };
+    } } },
+  });
+  const result = await agent.respond({
+    message: { username: "小明", text: "总结完整合并转发" }, history: [],
+    readForwarded({ forward_id, offset }) {
+      assert.equal(forward_id, forwardId);
+      offsets.push(offset);
+      return { forward_id: forwardId, total_entries: 31, next_offset: offset === 0 ? 30 : null,
+        entries: [{ text: offset === 0 ? "第一页原文" : "最后一页原文", attachments: [],
+          image_count: offset === 0 ? 1 : 0, imageUrls: offset === 0 ? ["https://example.invalid/first.png"] : [] }] };
+    },
+  });
+  assert.deepEqual(offsets, [0, 30]);
+  assert.deepEqual(requests[1].tools.map((tool) => tool.name), ["read_forwarded_message"]);
+  assert.deepEqual(requests[2].tools, []);
+  assert.match(JSON.stringify(requests[2].input), /第一页原文/);
+  assert.match(JSON.stringify(requests[2].input), /最后一页原文/);
+  assert.match(JSON.stringify(requests[2].input), /first\.png/);
+  assert.equal(result.text, "完整总结两页");
+});
+
+test("模型续页时不能重复读取或改用别的群聊记录标识", async () => {
+  let reads = 0;
+  let requests = 0;
+  const agent = new OpenAIResponsesAgent({ model: "test-model", client: { responses: { async create() {
+    requests += 1;
+    return { output: [{ type: "function_call", name: "read_forwarded_message", arguments: JSON.stringify({
+      forward_id: requests === 1 ? "page-test" : "different-card", offset: 0, limit: 1,
+    }) }] };
+  } } } });
+  const result = await agent.respond({ message: { username: "小明", text: "展开" }, history: [], readForwarded() {
+    reads += 1;
+    return { forward_id: "page-test", next_offset: 1, entries: [{ text: "实际原文", attachments: [] }] };
+  } });
+  assert.equal(reads, 1);
+  assert.match(result.text, /实际原文/);
+  assert.match(result.text, /下一页从第 2 条开始/);
+});
+
+test("长转发单轮最多展开五页，达到上限时明确告知仍有内容", async () => {
+  let offset = 0;
+  const requests = [];
+  const agent = new OpenAIResponsesAgent({ model: "test-model", client: { responses: { async create(body) {
+    requests.push(body);
+    if (body.tool_choice === "none") return { output_text: "已读取部分" };
+    return { output: [{ type: "function_call", name: "read_forwarded_message",
+      arguments: JSON.stringify({ forward_id: "long-forward", offset, limit: 30 }) }] };
+  } } } });
+  const result = await agent.respond({ message: { username: "小明", text: "总结完整转发" }, history: [], readForwarded(args) {
+    assert.equal(args.offset, offset);
+    offset += 30;
+    return { forward_id: "long-forward", next_offset: offset, total_entries: 180,
+      entries: [{ text: `第 ${offset} 条` }] };
+  } });
+  assert.equal(offset, 150);
+  assert.equal(requests.length, 6);
+  assert.equal(requests.at(-1).tool_choice, "none");
+  assert.match(result.text, /下一页从第 151 条开始/);
+});
+
+test("转发图片被 API 拒绝时保留正文重试并明确提示图片不可读", async () => {
+  const requests = [];
+  const forwardId = "forward-media-error";
+  const agent = new OpenAIResponsesAgent({ model: "test-model", client: { responses: { async create(body) {
+    requests.push(body);
+    if (requests.length === 1) return { output: [{ type: "function_call", name: "read_forwarded_message",
+      arguments: JSON.stringify({ forward_id: forwardId, offset: 0, limit: 20 }) }] };
+    if (requests.length === 2) throw new Error("expired image");
+    return { output_text: "正文总结" };
+  } } } });
+  const result = await agent.respond({ message: { username: "小明", text: "看转发图片" }, history: [], readForwarded() {
+    return { forward_id: forwardId, next_offset: null, entries: [{ text: "正文", attachments: [{ type: "image" }],
+      image_count: 1, imageUrls: ["https://example.invalid/temporary-image"] }] };
+  } });
+  assert.equal(requests.length, 3);
+  assert.match(JSON.stringify(requests[1].input), /input_image/);
+  assert.match(requests[2].input.at(-1).content, /"available_image_count":0/);
+  assert.doesNotMatch(JSON.stringify(requests[2].input), /temporary-image|input_image/);
+  assert.match(result.text, /正文总结/);
+  assert.match(result.text, /图片已过期或无法/);
+});
+
 test("AI 普通文本使用 SDK 的 output_text 便捷属性", async () => {
   const agent = new OpenAIResponsesAgent({
     model: "test-model",
