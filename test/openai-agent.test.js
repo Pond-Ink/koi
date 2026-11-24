@@ -7,6 +7,7 @@ test("AI 函数调用的参数交给本地命令执行，并直接返回确定�
   let executed;
   const agent = new OpenAIResponsesAgent({
     model: "test-model",
+    webSearch: "deepseek",
     client: {
       responses: {
         async create(body) {
@@ -35,6 +36,189 @@ test("AI 函数调用的参数交给本地命令执行，并直接返回确定�
   assert.equal(requestedBody.reasoning, undefined);
   assert.deepEqual(executed, { name: "command_ping", args: {} });
   assert.deepEqual(result, { text: "pong", commandName: "ping", route: "ai-tool" });
+});
+
+test("模型主动选择联网，DeepSeek 独立搜索请求只接收公开查询并附上来源", async () => {
+  const requests = [];
+  const source = "https://example.invalid/official-release";
+  const query = "Anthropic 官方 Claude Opus 4.6 发布日期";
+  const agent = new OpenAIResponsesAgent({
+    model: "deepseek-flash",
+    webSearch: "deepseek",
+    reasoningEffort: "none",
+    client: {
+      responses: {
+        async create(body) {
+          requests.push(body);
+          if (requests.length === 1) {
+            return { output: [{
+              type: "function_call",
+              name: "request_web_search",
+              arguments: JSON.stringify({ query }),
+            }] };
+          }
+          return {
+            status: "completed",
+            output: [
+              { type: "web_search_call", status: "completed", action: { type: "search" } },
+              { type: "message", content: [{
+                type: "output_text",
+                text: "2026 年 2 月 5 日发布。",
+                annotations: [
+                  { type: "url_citation", url: source },
+                  { type: "url_citation", url: source },
+                ],
+              }] },
+            ],
+          };
+        },
+      },
+    },
+  });
+
+  const localTools = [{ type: "function", name: "command_help" }];
+  const result = await agent.respond({
+    message: { username: "小明", text: "你知道 Opus 4.6 吗？", isExplicitBotMention: true },
+    history: [{ role: "user", content: "私人群聊记录" }],
+    tools: localTools,
+    executeTool() { assert.fail("联网查询不执行本地命令"); },
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].tools[0].name, "request_web_search");
+  assert.deepEqual(requests[0].tools.slice(1), localTools);
+  assert.match(requests[0].instructions, /即使用户未明确说要联网/);
+  assert.deepEqual(requests[0].reasoning, { effort: "none" });
+  assert.deepEqual(requests[1].tools, [{ type: "deepseek_web_search" }]);
+  assert.deepEqual(requests[1].input, [{ role: "user", content: query }]);
+  assert.deepEqual(requests[1].reasoning, { effort: "high" });
+  assert.equal(requests[1].store, false);
+  assert.deepEqual(result, { text: `2026 年 2 月 5 日发布。\n\n参考来源：\n${source}`, route: "ai-search" });
+});
+
+test("普通问题和静默决定不发起第二次联网请求", async () => {
+  const responses = ["这是稳定知识。", SELECTIVE_SILENCE];
+  const requests = [];
+  const agent = new OpenAIResponsesAgent({
+    model: "deepseek-flash",
+    webSearch: "deepseek",
+    client: {
+      responses: {
+        async create(body) {
+          requests.push(body);
+          return { output_text: responses[requests.length - 1] };
+        },
+      },
+    },
+  });
+  const request = {
+    message: { username: "小明", text: "递归是什么？" },
+    history: [],
+  };
+
+  assert.equal((await agent.respond(request)).route, "ai-text");
+  assert.deepEqual(await agent.respond({ ...request, engagement: "selective" }), {
+    text: null, route: "ai-silent",
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].tools[0].name, "request_web_search");
+  assert.deepEqual(requests[1].tools, []);
+});
+
+test("模型同时返回搜索和本地命令时，优先执行本地命令", async () => {
+  let requests = 0;
+  const agent = new OpenAIResponsesAgent({
+    model: "deepseek-flash",
+    webSearch: "deepseek",
+    client: {
+      responses: {
+        async create() {
+          requests += 1;
+          return { output: [
+            { type: "function_call", name: "request_web_search", arguments: '{"query":"新版本"}' },
+            { type: "function_call", name: "command_ai", arguments: '{"action":"off"}' },
+          ] };
+        },
+      },
+    },
+  });
+  const result = await agent.respond({
+    message: { username: "小明", text: "先关闭 AI" },
+    history: [],
+    async executeTool(name, args) {
+      assert.equal(name, "command_ai");
+      assert.deepEqual(args, { action: "off" });
+      return { text: "已关闭", commandName: "ai" };
+    },
+  });
+  assert.equal(requests, 1);
+  assert.deepEqual(result, { text: "已关闭", commandName: "ai", route: "ai-tool" });
+});
+
+test("旁听或关闭联网时，即使模型返回搜索工具调用也不会执行", async () => {
+  for (const [webSearch, engagement] of [["deepseek", "selective"], [null, "direct"]]) {
+    let calls = 0;
+    const agent = new OpenAIResponsesAgent({
+      model: "deepseek-flash",
+      webSearch,
+      client: {
+        responses: {
+          async create() {
+            calls += 1;
+            return { output: [{
+              type: "function_call", name: "request_web_search", arguments: '{"query":"新版本"}',
+            }] };
+          },
+        },
+      },
+    });
+
+    await assert.rejects(agent.respond({
+      message: { username: "小明", text: "新版本发布了吗？" },
+      history: [],
+      engagement,
+    }), /当前消息未启用联网搜索/);
+    assert.equal(calls, 1);
+  }
+});
+
+test("深度搜索使用实际打开的网页作为来源，并拒绝未完成或未执行搜索的回答", async () => {
+  const pageUrl = "https://example.invalid/official";
+  let response;
+  const agent = new OpenAIResponsesAgent({
+    model: "deepseek-flash",
+    webSearch: "deepseek",
+    client: {
+      responses: {
+        async create(body) {
+          if (body.tools[0].type === "deepseek_web_search") return response;
+          return { output: [{
+            type: "function_call", name: "request_web_search", arguments: '{"query":"查发布公告"}',
+          }] };
+        },
+      },
+    },
+  });
+  const request = { message: { username: "小明", text: "查发布公告" }, history: [] };
+  response = {
+    status: "completed",
+    output_text: "官方公告已发布。",
+    output: [{ type: "web_search_call", status: "completed", page: { url: pageUrl } }],
+  };
+  assert.deepEqual(await agent.respond(request), {
+    text: `官方公告已发布。\n\n参考来源：\n${pageUrl}`, route: "ai-search",
+  });
+  for (const unsuccessful of [
+    { status: "completed", output_text: "我已经搜过了。", output: [] },
+    { status: "failed", output_text: "部分结果", output: response.output },
+    { status: "completed", output: [{ type: "web_search_call", status: "failed" }] },
+  ]) {
+    response = unsuccessful;
+    assert.deepEqual(await agent.respond(request), {
+      text: "这次联网搜索未返回可核实的结果，暂时无法确认。",
+      route: "ai-search-error",
+    });
+  }
 });
 
 test("AI 请求使用配置的推理强度", async () => {

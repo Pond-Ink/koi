@@ -62,3 +62,16 @@ test("推理强度可由环境变量覆盖", () => {
   });
   assert.equal(config.ai.reasoningEffort, "high");
 });
+
+test("DeepSeek Flash 自动启用联网搜索，其他服务商保持原行为，可显式覆盖", () => {
+  const deepseekEnv = baseEnv({
+    OPENAI_TEXT_MODEL: "deepseek-v4-flash",
+    OPENAI_TEXT_BASE_URL: "https://api.deepseek.com/v1",
+  });
+  assert.equal(loadConfig({ env: deepseekEnv }).ai.webSearch, "deepseek");
+  assert.equal(loadConfig({ env: { ...deepseekEnv, OPENAI_TEXT_MODEL: "deepseek-flash" } }).ai.webSearch, "deepseek");
+  assert.equal(loadConfig({ env: { ...deepseekEnv, OPENAI_WEB_SEARCH: "off" } }).ai.webSearch, null);
+  assert.equal(loadConfig({ env: baseEnv() }).ai.webSearch, null);
+  assert.equal(loadConfig({ env: baseEnv({ OPENAI_WEB_SEARCH: "deepseek" }) }).ai.webSearch, "deepseek");
+  assert.throws(() => loadConfig({ env: baseEnv({ OPENAI_WEB_SEARCH: "invalid" }) }), /OPENAI_WEB_SEARCH/);
+});

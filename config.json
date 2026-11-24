@@ -9,7 +9,8 @@
   "ai": {
     "requestTimeoutMs": 30000,
     "maxRetries": 2,
-    "reasoningEffort": "high"
+    "reasoningEffort": "high",
+    "webSearch": "auto"
   },
   "memory": {
     "databasePath": "./data/koi.sqlite",

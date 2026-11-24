@@ -9,6 +9,11 @@ export class ConfigurationError extends Error {
 }
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const DEEPSEEK_FLASH_MODELS = new Set([
+  "deepseek-flash",
+  "deepseek-v4-flash",
+  "deepseek-v4-flash-vision-exp",
+]);
 
 function requireValue(env, name) {
   const value = env[name]?.trim();
@@ -50,6 +55,21 @@ function optionalReasoningEffort(value, name) {
     );
   }
   return value.trim();
+}
+
+function webSearchProvider(value, model, baseUrl) {
+  switch (value ?? "auto") {
+    case "auto":
+      return URL.parse(baseUrl)?.hostname === "api.deepseek.com" && DEEPSEEK_FLASH_MODELS.has(model)
+        ? "deepseek"
+        : null;
+    case "deepseek":
+      return "deepseek";
+    case "off":
+      return null;
+    default:
+      throw new ConfigurationError("OPENAI_WEB_SEARCH 或 ai.webSearch 必须是 auto、deepseek 或 off");
+  }
 }
 
 export function loadConfig({
@@ -97,6 +117,7 @@ export function loadConfig({
         env.OPENAI_REASONING_EFFORT ?? fileConfig.ai.reasoningEffort,
         "OPENAI_REASONING_EFFORT",
       ),
+      webSearch: webSearchProvider(env.OPENAI_WEB_SEARCH ?? fileConfig.ai.webSearch, textModel, textBaseUrl),
     }),
     memory: Object.freeze({
       databasePath: env.MEMORY_DATABASE_PATH || fileConfig.memory.databasePath,

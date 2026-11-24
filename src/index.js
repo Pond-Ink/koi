@@ -99,6 +99,7 @@ process.once("SIGTERM", () => void shutdown("SIGTERM"));
 logger.info("启动 QQ 群聊机器人", {
   intents: config.qq.intents,
   model: config.ai.model,
+  webSearch: config.ai.webSearch,
   persona: persona.name,
   memoryDatabase: database.filename,
 });
