@@ -1,3 +1,5 @@
+import { duplicateForwardHalfLength, isForwardTranscriptTitle, parseForwardTranscript } from "../qq/forwarded-transcript.js";
+
 const SCHEMA = `
 CREATE TABLE chat_archive (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chat_forward_records (
   entry_count INTEGER NOT NULL,
   entries_json TEXT NOT NULL,
   searchable_text TEXT NOT NULL,
+  format_version INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (group_openid, forward_id)
 );
 CREATE INDEX IF NOT EXISTS chat_forward_records_message
@@ -93,8 +96,65 @@ function beijingTime(timestamp) {
 function storedForwardEntries(entries) {
   return entries.map(({ imageUrls = [], ...entry }) => ({
     ...entry,
-    image_count: imageUrls.length,
+    image_count: Math.max(entry.image_count || 0, imageUrls.length, (entry.attachments || []).filter(({ type }) => (
+      /^image(?:\/|$)/i.test(String(type))
+    )).length),
   }));
+}
+
+function forwardSearchableText(entries) {
+  return entries.map((entry) => [
+    entry.sender, entry.text, ...(entry.attachments || []).map((attachment) => attachment.filename),
+  ].filter(Boolean).join("\n")).join("\n");
+}
+
+function legacyTranscriptNumber(entry) {
+  // Older versions split the raw transcript into consecutive sibling paths.
+  // Only rejoin those text-only rows; unrelated nested or structured records
+  // must not be folded together.
+  if (!Array.isArray(entry?.path) || !entry.path.length || entry.attachments?.length || entry.image_count) return null;
+  const match = /^\s*===[ \t]*消息[ \t]+(\d+)[ \t]*===[ \t]*(?:\r?\n|$)/.exec(entry.text);
+  return match ? Number(match[1]) : null;
+}
+
+function duplicateLegacyEntryIndices(entries) {
+  const skip = new Set();
+  for (let start = 0; start < entries.length; start += 1) {
+    const first = entries[start];
+    if (legacyTranscriptNumber(first) !== 1) continue;
+    let end = start + 1;
+    for (; end < entries.length; end += 1) {
+      const entry = entries[end];
+      if (legacyTranscriptNumber(entry) !== end - start + 1
+        || entry.path.length !== first.path.length
+        || !first.path.slice(0, -1).every((part, index) => part === entry.path[index])
+        || entry.path.at(-1) !== first.path.at(-1) + end - start) break;
+    }
+    const run = entries.slice(start, end);
+    const half = duplicateForwardHalfLength(run.map((entry) => entry.text).join("\n"));
+    if (half !== null && half * 2 === run.length) {
+      for (let index = start + half; index < end; index += 1) skip.add(index);
+    }
+    start = end - 1;
+  }
+  return skip;
+}
+
+function upgradeLegacyForwardEntries(entries) {
+  const parsed = entries.map((entry) => parseForwardTranscript(entry.text));
+  const duplicates = duplicateLegacyEntryIndices(entries);
+  return entries.flatMap((entry, index) => {
+    if (duplicates.has(index)) return [];
+    if (isForwardTranscriptTitle(entry.text) && !entry.sender && !entry.time && !entry.attachments?.length && !entry.image_count
+      && parsed[index + 1]) return [];
+    if (!parsed[index]) return [entry];
+    return parsed[index].map((item, part) => ({
+      ...entry,
+      ...item,
+      attachments: part === 0 ? [...(entry.attachments || []), ...item.attachments] : item.attachments,
+      image_count: part === 0 ? (entry.image_count || 0) + item.imageUrls.length : item.imageUrls.length,
+    }));
+  });
 }
 
 export class SqliteChatArchive {
@@ -105,6 +165,7 @@ export class SqliteChatArchive {
     this.forwardMedia = new Map();
     this.initialize();
     database.connection.exec(FORWARD_SCHEMA);
+    this.upgradeForwardTranscripts();
     this.insert = database.connection.prepare(`
       INSERT INTO chat_archive (
         group_openid, record_key, role, message_id, sender_openid, sender_name,
@@ -115,8 +176,8 @@ export class SqliteChatArchive {
     this.insertForward = database.connection.prepare(`
       INSERT INTO chat_forward_records (
         group_openid, forward_id, message_id, message_index, source, entry_count,
-        entries_json, searchable_text
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        entries_json, searchable_text, format_version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2)
       ON CONFLICT (group_openid, forward_id) DO NOTHING
     `);
     this.getForward = database.connection.prepare(`
@@ -129,6 +190,39 @@ export class SqliteChatArchive {
         AND (message_index = ? OR message_id = ?)
       LIMIT 2
     `);
+  }
+
+  upgradeForwardTranscripts() {
+    const connection = this.database.connection;
+    this.database.transaction(() => {
+      const hasVersion = connection.prepare("PRAGMA table_info(chat_forward_records)").all()
+        .some((column) => column.name === "format_version");
+      if (!hasVersion) connection.exec("ALTER TABLE chat_forward_records ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1");
+      const update = connection.prepare(`
+        UPDATE chat_forward_records SET entry_count = ?, entries_json = ?, searchable_text = ?, format_version = 2
+        WHERE group_openid = ? AND forward_id = ?
+      `);
+      const updateReference = connection.prepare(`
+        UPDATE chat_archive SET content = replace(content, ?, ?)
+        WHERE group_openid = ? AND message_id = ? AND role = 'user'
+      `);
+      for (const row of connection.prepare(`
+        SELECT f.*, (SELECT a.sent_at FROM chat_archive AS a
+          WHERE a.group_openid = f.group_openid AND a.message_id = f.message_id AND a.role = 'user' LIMIT 1) AS received_at
+        FROM chat_forward_records AS f WHERE format_version = 1
+      `).all()) {
+        const entries = upgradeLegacyForwardEntries(JSON.parse(row.entries_json));
+        const stored = storedForwardEntries(entries);
+        update.run(stored.length, JSON.stringify(stored), forwardSearchableText(stored), row.group_openid, row.forward_id);
+        if (row.entry_count !== stored.length) updateReference.run(
+          `[合并转发 ${row.forward_id}，${row.entry_count} 条目]`,
+          `[合并转发 ${row.forward_id}，${stored.length} 条目]`, row.group_openid, row.message_id,
+        );
+        if (row.received_at !== null) this.cacheForwardMedia(
+          row.group_openid, { id: row.forward_id, entries }, row.received_at + FORWARD_MEDIA_TTL_MS,
+        );
+      }
+    });
   }
 
   initialize() {
@@ -184,28 +278,26 @@ export class SqliteChatArchive {
       insertMessage();
       for (const card of cards) {
         const entries = storedForwardEntries(card.entries);
-        const searchable = entries.map((entry) => [
-          entry.sender, entry.text, ...(entry.attachments || []).map((attachment) => attachment.filename),
-        ].filter(Boolean).join("\n")).join("\n");
         this.insertForward.run(
           message.groupOpenid, card.id, message.msgId, message.msgIndex || null,
-          card.source, entries.length, JSON.stringify(entries), searchable,
+          card.source, entries.length, JSON.stringify(entries), forwardSearchableText(entries),
         );
       }
     });
     for (const card of cards) this.cacheForwardMedia(message.groupOpenid, card);
   }
 
-  cacheForwardMedia(groupOpenid, card) {
+  cacheForwardMedia(groupOpenid, card, expiresAt = this.clock() + FORWARD_MEDIA_TTL_MS) {
     const images = card.entries.map((entry) => entry.imageUrls || []);
     if (!images.some((urls) => urls.length)) return;
     const now = this.clock();
+    if (expiresAt <= now) return;
     for (const [key, cached] of this.forwardMedia) {
       if (cached.expiresAt <= now) this.forwardMedia.delete(key);
     }
     const key = JSON.stringify([groupOpenid, card.id]);
     this.forwardMedia.delete(key);
-    this.forwardMedia.set(key, { images, expiresAt: now + FORWARD_MEDIA_TTL_MS });
+    this.forwardMedia.set(key, { images, expiresAt: Math.min(expiresAt, now + FORWARD_MEDIA_TTL_MS) });
     if (this.forwardMedia.size > FORWARD_MEDIA_LIMIT) {
       this.forwardMedia.delete(this.forwardMedia.keys().next().value);
     }

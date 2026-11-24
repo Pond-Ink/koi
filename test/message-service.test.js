@@ -142,16 +142,16 @@ test("完整存档包含纯文件消息、原始正文、命令和实际发送�
 });
 
 test("普通群聊只注入合并转发引用，后续 @ 查询调用工具才提交正文和图片", async () => {
-  const event = payload({ id: "lazy-forward", content: "[聊天记录]" });
+  const imageUrl = "https://multimedia.nt.qq.com.cn/download?fileid=lazy-image&rkey=temporary";
+  const event = payload({ id: "lazy-forward", content: [
+    "[小明的聊天记录]", "=== 消息 1 ===", "[消息内容] 第一条转发原文", "[发送者] 小明",
+    "=== 消息 2 ===", "[消息内容] 第二条转发原文", "[发送者] 小红",
+    `[附件1] 类型:图片 文件名:图片.png 尺寸:596x430 大小:65.3KB URL:${imageUrl}`,
+  ].join("\n") });
   event.t = "GROUP_MESSAGE_CREATE";
   event.d.mentions = [];
   event.d.message_type = 102;
-  event.d.msg_elements = [
-    { content: "第一条转发原文" },
-    { content: "第二条转发原文", attachments: [
-      { content_type: "image/png", url: "https://example.invalid/lazy-image.png?token=temporary" },
-    ] },
-  ];
+  event.d.msg_elements = [];
   const forwardId = normalizeGroupMessageEvent(event).forwardedMessages[0].id;
   const requests = [];
   const agent = new OpenAIResponsesAgent({
@@ -186,8 +186,9 @@ test("普通群聊只注入合并转发引用，后续 @ 查询调用工具才�
   const expanded = requests[2].input.at(-1).content;
   assert.match(expanded[0].text, /第一条转发原文/);
   assert.match(expanded[0].text, /第二条转发原文/);
+  assert.doesNotMatch(expanded[0].text, /rkey=temporary|lazy-image/);
   assert.deepEqual(expanded[1], {
-    type: "input_image", image_url: "https://example.invalid/lazy-image.png?token=temporary", detail: "auto",
+    type: "input_image", image_url: imageUrl, detail: "auto",
   });
   assert.deepEqual(requests[2].tools, []);
   assert.equal(sent[0].content, "转发总结");
